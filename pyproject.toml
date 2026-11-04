@@ -1,0 +1,58 @@
+﻿[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "kuyebiko"
+version = "0.1.0"
+description = "A local-first Windows ransomware behaviour monitoring and investigation platform."
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "python-dotenv>=1.0",
+]
+
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=6.0",
+    "ruff>=0.9",
+]
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["src"]
+
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "B",
+    "UP",
+]
+
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
