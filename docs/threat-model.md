@@ -1,4 +1,4 @@
-﻿# Kuyebiko — Security Threat Model
+# Kuyebiko — Security Threat Model
 
 ## 1. Security Objectives
 

@@ -1,4 +1,4 @@
-﻿# Kuyebiko — System Architecture and Technical Design
+# Kuyebiko — System Architecture and Technical Design
 
 ## 1. Project Overview
 

@@ -1,4 +1,4 @@
-﻿# Kuyebiko — Detection Benchmark and Validation Methodology
+# Kuyebiko — Detection Benchmark and Validation Methodology
 
 ## 1. Purpose & Core Evaluation Philosophy
 

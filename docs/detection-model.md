@@ -1,4 +1,4 @@
-﻿# Kuyebiko — Behavioural Detection Model
+# Kuyebiko — Behavioural Detection Model
 
 ## 1. Detection Philosophy
 

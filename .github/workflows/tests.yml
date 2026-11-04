@@ -1,4 +1,4 @@
-﻿name: Kuyebiko CI
+name: Kuyebiko CI
 
 on:
   push:
