@@ -16,11 +16,18 @@ from kuyebiko.core.exceptions import RegistryError
 class DummyWatcher(BaseWatcher):
     """Controllable test watcher for unit testing MonitoredRootRegistry."""
 
-    def __init__(self, root: MonitoredRoot, callback, should_fail: bool = False):
+    def __init__(
+        self,
+        root: MonitoredRoot,
+        callback,
+        should_fail: bool = False,
+        stop_should_fail: bool = False,
+    ):
         self._root = root
         self._callback = callback
         self._running = False
         self._should_fail = should_fail
+        self._stop_should_fail = stop_should_fail
         self._degraded = False
 
     @property
@@ -45,6 +52,8 @@ class DummyWatcher(BaseWatcher):
         self._running = True
 
     def stop(self) -> None:
+        if self._stop_should_fail:
+            raise RuntimeError("Simulated watcher shutdown failure")
         self._running = False
 
     def is_running(self) -> bool:
@@ -298,3 +307,95 @@ def test_registry_rejects_operations_during_transitional_states(tmp_path: Path):
 
     with pytest.raises(RegistryError, match="currently stopping"):
         registry.start("root-trans")
+
+
+def test_registry_factory_failure_resets_state_to_stopped(tmp_path: Path):
+    def broken_factory(r, cb):
+        raise RuntimeError("Simulated watcher factory failure")
+
+    registry = MonitoredRootRegistry(watcher_factory=broken_factory)
+    root = MonitoredRoot(root_id="root-factory-fail", path=tmp_path)
+    registry.register(root)
+
+    with pytest.raises(RegistryError, match="Simulated watcher factory failure"):
+        registry.start("root-factory-fail")
+
+    # State must be reset to STOPPED, not left stuck in STARTING
+    assert registry.get_state("root-factory-fail") == RootLifecycleState.STOPPED
+    assert registry.get_watcher("root-factory-fail") is None
+
+
+def test_registry_stop_failure_retains_watcher_and_running_state(tmp_path: Path):
+    registry = MonitoredRootRegistry(
+        watcher_factory=lambda r, cb: DummyWatcher(r, cb, stop_should_fail=True)
+    )
+    root = MonitoredRoot(root_id="root-stop-fail", path=tmp_path)
+    registry.register(root)
+    registry.start("root-stop-fail")
+
+    watcher = registry.get_watcher("root-stop-fail")
+    assert watcher is not None
+
+    with pytest.raises(RegistryError, match="Simulated watcher shutdown failure"):
+        registry.stop("root-stop-fail")
+
+    # Registry MUST retain the watcher and RUNNING state
+    assert registry.get_state("root-stop-fail") == RootLifecycleState.RUNNING
+    assert registry.get_watcher("root-stop-fail") is watcher
+
+    # Cannot start duplicate while still running
+    with pytest.raises(RegistryError, match="already running"):
+        registry.start("root-stop-fail")
+
+
+def test_registry_unregister_failure_retains_root_and_watcher(tmp_path: Path):
+    registry = MonitoredRootRegistry(
+        watcher_factory=lambda r, cb: DummyWatcher(r, cb, stop_should_fail=True)
+    )
+    root = MonitoredRoot(root_id="root-unreg-fail", path=tmp_path)
+    registry.register(root)
+    registry.start("root-unreg-fail")
+
+    watcher = registry.get_watcher("root-unreg-fail")
+
+    with pytest.raises(RegistryError, match="Simulated watcher shutdown failure"):
+        registry.unregister("root-unreg-fail")
+
+    # Root, watcher, and state must be retained
+    assert registry.is_registered("root-unreg-fail") is True
+    assert registry.get_state("root-unreg-fail") == RootLifecycleState.RUNNING
+    assert registry.get_watcher("root-unreg-fail") is watcher
+
+    # Attempting to register another root for same canonical path must be blocked
+    root_duplicate = MonitoredRoot(root_id="root-dup", path=tmp_path)
+    with pytest.raises(RegistryError, match="already registered under root ID"):
+        registry.register(root_duplicate)
+
+
+def test_registry_stop_all_failure_retains_failing_watcher(tmp_path: Path):
+    d1 = tmp_path / "dir1"
+    d2 = tmp_path / "dir2"
+    d1.mkdir()
+    d2.mkdir()
+
+    def selective_factory(r, cb):
+        # dir2 watcher fails on stop, dir1 stops cleanly
+        should_fail_stop = r.root_id == "r2"
+        return DummyWatcher(r, cb, stop_should_fail=should_fail_stop)
+
+    registry = MonitoredRootRegistry(watcher_factory=selective_factory)
+    registry.register(MonitoredRoot(root_id="r1", path=d1))
+    registry.register(MonitoredRoot(root_id="r2", path=d2))
+    registry.start("r1")
+    registry.start("r2")
+
+    with pytest.raises(RegistryError, match="Failed to stop watchers for roots: r2"):
+        registry.stop_all()
+
+    # r1 stopped cleanly and was removed
+    assert registry.get_state("r1") == RootLifecycleState.STOPPED
+    assert registry.get_watcher("r1") is None
+
+    # r2 failed to stop and remains RUNNING in registry
+    assert registry.get_state("r2") == RootLifecycleState.RUNNING
+    assert registry.get_watcher("r2") is not None
