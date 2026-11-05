@@ -61,9 +61,9 @@ Kuyebiko is actively under development. Below is the verified status of the code
 - **Centralized Diagnostic Logging (`src/kuyebiko/utils/logging_config.py`):**
   - Rotating file logger (`5 MB` max size, `5` backup archives) and stream console logger with clean formatting and shutdown handlers.
 - **Test Suite (`tests/`):**
-  - **101 comprehensive unit tests** (`tests/unit/`) validating collector models, parser edge cases, native watcher thread lifecycle, multi-root registry coordination, domain schemas, configuration, and logging.
+  - **111 comprehensive unit tests** (`tests/unit/`) validating collector models, parser edge cases, native watcher thread lifecycle, multi-root registry coordination, domain schemas, configuration, and logging.
   - **9 integration tests** (`tests/integration/`) verifying live Windows `ReadDirectoryChangesW` filesystem events (creation, modification, deletion, renames), recursive vs. non-recursive monitoring, watcher stopping semantics, multi-root directory isolation, and async database WAL operations.
-  - **110 total passing tests** with **92% overall code coverage**.
+  - **120 total passing tests** with **92% overall code coverage**.
 
 ### Partially Implemented Functionality
 - **Package Architecture:** Modular package structure established under `src/kuyebiko/` with package initializers (`processing`, `detection`, `integrity`, `application`).
@@ -140,7 +140,7 @@ Kuyebiko/
 │           └── logging_config.py # Rotating logger configuration (Implemented)
 ├── tests/
 │   ├── __init__.py
-│   ├── unit/                     # Unit test suite (101 passing tests)
+│   ├── unit/                     # Unit test suite (111 passing tests)
 │   │   ├── test_collector_models.py
 │   │   ├── test_config.py
 │   │   ├── test_database.py

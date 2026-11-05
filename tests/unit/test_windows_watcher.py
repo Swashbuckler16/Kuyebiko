@@ -220,3 +220,96 @@ def test_watcher_safe_repeated_stop(tmp_path: Path):
     watcher.stop()
     watcher.stop()
     assert watcher.is_running() is False
+
+
+def test_watcher_buffer_size_validation(tmp_path: Path):
+    root = MonitoredRoot(root_id="root-buf", path=tmp_path)
+
+    with pytest.raises(ValueError, match="at least 4096 bytes"):
+        WindowsDirectoryWatcher(root=root, buffer_size=1024)
+
+    with pytest.raises(ValueError, match="cannot exceed 65536 bytes"):
+        WindowsDirectoryWatcher(root=root, buffer_size=70000)
+
+    with pytest.raises(ValueError, match="4-byte"):
+        WindowsDirectoryWatcher(root=root, buffer_size=4097)
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        WindowsDirectoryWatcher(root=root, buffer_size="65536")  # type: ignore
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        WindowsDirectoryWatcher(root=root, buffer_size=True)  # type: ignore
+
+    valid_watcher = WindowsDirectoryWatcher(root=root, buffer_size=8192)
+    assert valid_watcher._buffer_size == 8192
+
+
+def test_watcher_stop_times_out_and_raises_without_closing_handle(
+    tmp_path: Path, monkeypatch
+):
+    root = MonitoredRoot(root_id="root-timeout", path=tmp_path)
+    watcher = WindowsDirectoryWatcher(root=root)
+
+    closed_handles = []
+    hang_in_read = threading.Event()
+    hang_in_join = threading.Event()
+
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.open_directory_handle",
+        lambda p: 777,
+    )
+
+    def mock_read(*args, **kwargs):
+        # Ignore cancellation initially to simulate hung I/O
+        hang_in_read.wait(timeout=2.0)
+        return False, 0, ERROR_OPERATION_ABORTED
+
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.read_directory_changes",
+        mock_read,
+    )
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.cancel_io_for_handle",
+        lambda h: True,
+    )
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.close_directory_handle",
+        lambda h: closed_handles.append(h),
+    )
+
+    # Monkeypatch thread.join to timeout immediately to keep test fast
+    orig_join = threading.Thread.join
+
+    def fast_timeout_join(thread_self, timeout=None):
+        if not hang_in_join.is_set():
+            # Return while thread is still alive
+            return
+        orig_join(thread_self, timeout=timeout)
+
+    monkeypatch.setattr(threading.Thread, "join", fast_timeout_join)
+
+    try:
+        watcher.start()
+        assert watcher.is_running() is True
+
+        # Stop should fail, raise WatcherError, mark degraded, and NOT close handle
+        with pytest.raises(WatcherError, match="failed to terminate within timeout"):
+            watcher.stop()
+
+        assert watcher.is_degraded is True
+        assert "use-after-close" in watcher.degradation_reason
+        assert len(closed_handles) == 0  # Handle MUST NOT be closed!
+
+        # Now allow thread and join to complete normally
+        hang_in_join.set()
+        hang_in_read.set()
+        time.sleep(0.05)
+
+        # Subsequent stop can now safely clean up
+        watcher.stop()
+        assert len(closed_handles) == 1
+        assert closed_handles[0] == 777
+        assert watcher.is_running() is False
+    finally:
+        hang_in_join.set()
+        hang_in_read.set()

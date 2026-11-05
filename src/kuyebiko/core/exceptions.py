@@ -23,4 +23,3 @@ class BufferParseError(CollectorError):
 
 class PathValidationError(CollectorError):
     """Raised when a path fails security or validation rules."""
-

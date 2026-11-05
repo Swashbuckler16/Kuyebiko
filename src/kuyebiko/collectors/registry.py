@@ -1,6 +1,7 @@
 import logging
 import threading
 from collections.abc import Callable
+from enum import Enum, auto
 from pathlib import Path
 
 from kuyebiko.collectors.base import BaseWatcher, NotificationCallback
@@ -11,6 +12,15 @@ from kuyebiko.core.exceptions import RegistryError
 logger = logging.getLogger("kuyebiko.collectors.registry")
 
 WatcherFactory = Callable[[MonitoredRoot, NotificationCallback], BaseWatcher]
+
+
+class RootLifecycleState(Enum):
+    """Lifecycle state of a registered monitored root."""
+
+    STOPPED = auto()
+    STARTING = auto()
+    RUNNING = auto()
+    STOPPING = auto()
 
 
 def _default_watcher_factory(
@@ -31,6 +41,7 @@ class MonitoredRootRegistry:
         self._roots: dict[str, MonitoredRoot] = {}
         self._canonical_paths: dict[Path, str] = {}  # canonical path -> root_id
         self._watchers: dict[str, BaseWatcher] = {}
+        self._states: dict[str, RootLifecycleState] = {}
         self._callbacks: dict[str, NotificationCallback] = {}
 
         self._default_callback = default_callback
@@ -70,6 +81,7 @@ class MonitoredRootRegistry:
 
             self._roots[root.root_id] = root
             self._canonical_paths[canonical] = root.root_id
+            self._states[root.root_id] = RootLifecycleState.STOPPED
             if callback is not None:
                 self._callbacks[root.root_id] = callback
 
@@ -86,7 +98,7 @@ class MonitoredRootRegistry:
             root_id: Unique identifier of the root to remove.
 
         Raises:
-            RegistryError: If root_id is not registered.
+            RegistryError: If root_id is not registered or currently starting.
         """
         watcher_to_stop: BaseWatcher | None = None
 
@@ -94,18 +106,22 @@ class MonitoredRootRegistry:
             if root_id not in self._roots:
                 raise RegistryError(f"Root ID '{root_id}' is not registered")
 
+            state = self._states.get(root_id, RootLifecycleState.STOPPED)
+            if state == RootLifecycleState.STARTING:
+                raise RegistryError(
+                    f"Cannot unregister root '{root_id}' while it is starting"
+                )
+
             root = self._roots[root_id]
             canonical = root.resolved_path()
 
-            # Identify if an active watcher exists
-            if root_id in self._watchers:
-                watcher_to_stop = self._watchers.pop(root_id)
+            self._states[root_id] = RootLifecycleState.STOPPING
+            watcher_to_stop = self._watchers.pop(root_id, None)
 
             self._roots.pop(root_id, None)
             self._canonical_paths.pop(canonical, None)
             self._callbacks.pop(root_id, None)
 
-        # Stop watcher outside the lock to prevent deadlock
         if watcher_to_stop is not None:
             try:
                 watcher_to_stop.stop()
@@ -115,6 +131,12 @@ class MonitoredRootRegistry:
                     root_id,
                     err,
                 )
+            finally:
+                with self._lock:
+                    self._states.pop(root_id, None)
+        else:
+            with self._lock:
+                self._states.pop(root_id, None)
 
         logger.info("Unregistered root '%s'", root_id)
 
@@ -125,7 +147,7 @@ class MonitoredRootRegistry:
             root_id: Identifier of the root to start.
 
         Raises:
-            RegistryError: If the root is unknown, disabled, or already active.
+            RegistryError: If the root is unknown, disabled, or not in STOPPED state.
         """
         with self._lock:
             if root_id not in self._roots:
@@ -135,8 +157,15 @@ class MonitoredRootRegistry:
             if not root.enabled:
                 raise RegistryError(f"Cannot start disabled root '{root_id}'")
 
-            if root_id in self._watchers and self._watchers[root_id].is_running():
-                raise RegistryError(f"Watcher for root '{root_id}' is already active")
+            state = self._states.get(root_id, RootLifecycleState.STOPPED)
+            if state in (RootLifecycleState.STARTING, RootLifecycleState.RUNNING):
+                raise RegistryError(
+                    f"Watcher for root '{root_id}' is already {state.name.lower()}"
+                )
+            if state == RootLifecycleState.STOPPING:
+                raise RegistryError(f"Root '{root_id}' is currently stopping")
+
+            self._states[root_id] = RootLifecycleState.STARTING
 
             # Build routed notification callback
             def routed_callback(notification: RawFileNotification) -> None:
@@ -145,28 +174,42 @@ class MonitoredRootRegistry:
             watcher = self._watcher_factory(root, routed_callback)
             self._watchers[root_id] = watcher
 
-        # Start watcher outside lock
-        try:
-            watcher.start()
-        except Exception as err:
-            with self._lock:
+            try:
+                watcher.start()
+                self._states[root_id] = RootLifecycleState.RUNNING
+            except Exception as err:
                 self._watchers.pop(root_id, None)
-            logger.error("Failed to start watcher for root '%s': %s", root_id, err)
-            raise RegistryError(
-                f"Failed to start watcher for root '{root_id}': {err}"
-            ) from err
+                self._states[root_id] = RootLifecycleState.STOPPED
+                logger.error("Failed to start watcher for root '%s': %s", root_id, err)
+                raise RegistryError(
+                    f"Failed to start watcher for root '{root_id}': {err}"
+                ) from err
 
     def stop(self, root_id: str) -> None:
         """Stop monitoring for a specific root.
 
         Args:
             root_id: Identifier of the root to stop.
+
+        Raises:
+            RegistryError: If the root is currently starting.
         """
         watcher_to_stop: BaseWatcher | None = None
 
         with self._lock:
-            if root_id in self._watchers:
-                watcher_to_stop = self._watchers.pop(root_id)
+            if root_id not in self._roots:
+                return
+
+            state = self._states.get(root_id, RootLifecycleState.STOPPED)
+            if state in (RootLifecycleState.STOPPED, RootLifecycleState.STOPPING):
+                return
+            if state == RootLifecycleState.STARTING:
+                raise RegistryError(
+                    f"Cannot stop root '{root_id}' while it is starting"
+                )
+
+            self._states[root_id] = RootLifecycleState.STOPPING
+            watcher_to_stop = self._watchers.get(root_id)
 
         if watcher_to_stop is not None:
             try:
@@ -177,6 +220,18 @@ class MonitoredRootRegistry:
                     root_id,
                     err,
                 )
+                raise RegistryError(
+                    f"Failed to stop watcher for root '{root_id}': {err}"
+                ) from err
+            finally:
+                with self._lock:
+                    if root_id in self._roots:
+                        self._states[root_id] = RootLifecycleState.STOPPED
+                    self._watchers.pop(root_id, None)
+        else:
+            with self._lock:
+                if root_id in self._roots:
+                    self._states[root_id] = RootLifecycleState.STOPPED
 
     def start_all(self) -> dict[str, bool]:
         """Start monitoring on all registered roots that are enabled.
@@ -190,7 +245,6 @@ class MonitoredRootRegistry:
         results: dict[str, bool] = {}
         for root_id in candidate_roots:
             try:
-                # Only start if not already active
                 if not self.is_active(root_id):
                     self.start(root_id)
                 results[root_id] = True
@@ -206,11 +260,14 @@ class MonitoredRootRegistry:
 
     def stop_all(self) -> None:
         """Stop all currently active watchers."""
-        with self._lock:
-            watchers_to_stop = list(self._watchers.values())
-            self._watchers.clear()
+        watchers_to_stop: list[tuple[str, BaseWatcher]] = []
 
-        for watcher in watchers_to_stop:
+        with self._lock:
+            for root_id, watcher in list(self._watchers.items()):
+                self._states[root_id] = RootLifecycleState.STOPPING
+                watchers_to_stop.append((root_id, watcher))
+
+        for root_id, watcher in watchers_to_stop:
             try:
                 watcher.stop()
             except Exception as err:
@@ -219,6 +276,18 @@ class MonitoredRootRegistry:
                     watcher.root_id,
                     err,
                 )
+            finally:
+                with self._lock:
+                    if root_id in self._roots:
+                        self._states[root_id] = RootLifecycleState.STOPPED
+                    self._watchers.pop(root_id, None)
+
+    def get_state(self, root_id: str) -> RootLifecycleState:
+        """Return the current lifecycle state of a registered root."""
+        with self._lock:
+            if root_id not in self._roots:
+                raise RegistryError(f"Root ID '{root_id}' is not registered")
+            return self._states[root_id]
 
     def get(self, root_id: str) -> MonitoredRoot:
         """Retrieve a registered MonitoredRoot by its ID."""
@@ -237,8 +306,8 @@ class MonitoredRootRegistry:
         with self._lock:
             return [
                 root_id
-                for root_id, watcher in self._watchers.items()
-                if watcher.is_running()
+                for root_id, state in self._states.items()
+                if state == RootLifecycleState.RUNNING
             ]
 
     def is_registered(self, root_id: str) -> bool:
@@ -249,8 +318,7 @@ class MonitoredRootRegistry:
     def is_active(self, root_id: str) -> bool:
         """Check if an active watcher is running for the given root ID."""
         with self._lock:
-            watcher = self._watchers.get(root_id)
-            return watcher is not None and watcher.is_running()
+            return self._states.get(root_id) == RootLifecycleState.RUNNING
 
     def get_watcher(self, root_id: str) -> BaseWatcher | None:
         """Retrieve the active watcher for a root if present."""

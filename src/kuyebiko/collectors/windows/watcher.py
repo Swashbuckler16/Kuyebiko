@@ -13,6 +13,8 @@ from kuyebiko.collectors.windows.api import (
     ERROR_ACCESS_DENIED,
     ERROR_NOTIFY_ENUM_DIR,
     ERROR_OPERATION_ABORTED,
+    MAX_BUFFER_SIZE,
+    MIN_BUFFER_SIZE,
     cancel_io_for_handle,
     close_directory_handle,
     is_valid_handle,
@@ -35,9 +37,27 @@ class WindowsDirectoryWatcher(BaseWatcher):
         buffer_size: int = DEFAULT_BUFFER_SIZE,
         notify_filter: int = DEFAULT_NOTIFY_FILTER,
     ) -> None:
+        if not isinstance(buffer_size, int) or isinstance(buffer_size, bool):
+            raise ValueError(
+                f"buffer_size must be an integer, got {type(buffer_size).__name__}"
+            )
+        if buffer_size < MIN_BUFFER_SIZE:
+            raise ValueError(
+                f"buffer_size must be at least {MIN_BUFFER_SIZE} bytes, "
+                f"got {buffer_size}"
+            )
+        if buffer_size > MAX_BUFFER_SIZE:
+            raise ValueError(
+                f"buffer_size cannot exceed {MAX_BUFFER_SIZE} bytes, got {buffer_size}"
+            )
+        if buffer_size % 4 != 0:
+            raise ValueError(
+                f"buffer_size must be 4-byte (DWORD) aligned, got {buffer_size}"
+            )
+
         self._root = root
         self._callback = callback
-        self._buffer_size = max(4096, buffer_size)
+        self._buffer_size = buffer_size
         self._notify_filter = notify_filter
 
         self._handle: int | None = None
@@ -116,7 +136,11 @@ class WindowsDirectoryWatcher(BaseWatcher):
             )
 
     def stop(self) -> None:
-        """Cleanly cancel pending reads and stop the background monitoring thread."""
+        """Cleanly cancel pending reads and stop the background monitoring thread.
+
+        Raises:
+            WatcherError: If the worker thread fails to terminate within the timeout.
+        """
         with self._lock:
             if not self.is_running() and self._thread is None:
                 return
@@ -131,9 +155,13 @@ class WindowsDirectoryWatcher(BaseWatcher):
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=5.0)
             if self._thread.is_alive():
-                logger.warning(
-                    "Watcher thread for root '%s' did not terminate within timeout",
-                    self.root_id,
+                self._mark_degraded(
+                    f"Watcher thread for root '{self.root_id}' did not terminate "
+                    "within timeout; handle retained to prevent use-after-close race."
+                )
+                raise WatcherError(
+                    f"Watcher thread for root '{self.root_id}' failed to terminate "
+                    "within timeout; handle retained to prevent use-after-close race."
                 )
 
         with self._lock:

@@ -42,7 +42,9 @@ ERROR_OPERATION_ABORTED = 995
 ERROR_NOTIFY_ENUM_DIR = 1022
 
 # Buffer and Handle Bounds
+MIN_BUFFER_SIZE = 4096
 DEFAULT_BUFFER_SIZE = 65536  # 64 KB alignment boundary
+MAX_BUFFER_SIZE = 65536  # 64 KB Win32 recommended limit
 INVALID_HANDLE_VALUE = -1
 
 
@@ -192,4 +194,3 @@ def get_last_error() -> int:
     if not is_windows_platform() or _GetLastError is None:
         return 0
     return int(_GetLastError())
-

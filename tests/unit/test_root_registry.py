@@ -9,7 +9,7 @@ from kuyebiko.collectors.models import (
     RawFileNotification,
     WindowsFileAction,
 )
-from kuyebiko.collectors.registry import MonitoredRootRegistry
+from kuyebiko.collectors.registry import MonitoredRootRegistry, RootLifecycleState
 from kuyebiko.core.exceptions import RegistryError
 
 
@@ -260,3 +260,41 @@ def test_registry_callback_exception_handled_safely(tmp_path: Path):
     watchers["root-cb"].emit_event("test.txt", WindowsFileAction.ADDED)
     assert faulty_callback.call_count == 1
     registry.stop_all()
+
+
+def test_registry_lifecycle_state_transitions(tmp_path: Path):
+    registry = MonitoredRootRegistry(watcher_factory=lambda r, cb: DummyWatcher(r, cb))
+    root = MonitoredRoot(root_id="root-state", path=tmp_path)
+    registry.register(root)
+
+    assert registry.get_state("root-state") == RootLifecycleState.STOPPED
+
+    registry.start("root-state")
+    assert registry.get_state("root-state") == RootLifecycleState.RUNNING
+
+    with pytest.raises(RegistryError, match="already running"):
+        registry.start("root-state")
+
+    registry.stop("root-state")
+    assert registry.get_state("root-state") == RootLifecycleState.STOPPED
+
+
+def test_registry_rejects_operations_during_transitional_states(tmp_path: Path):
+    registry = MonitoredRootRegistry(watcher_factory=lambda r, cb: DummyWatcher(r, cb))
+    root = MonitoredRoot(root_id="root-trans", path=tmp_path)
+    registry.register(root)
+
+    # Manually simulate STARTING state to test concurrency gates
+    registry._states["root-trans"] = RootLifecycleState.STARTING
+
+    with pytest.raises(RegistryError, match="while it is starting"):
+        registry.stop("root-trans")
+
+    with pytest.raises(RegistryError, match="while it is starting"):
+        registry.unregister("root-trans")
+
+    # Manually simulate STOPPING state to test concurrency gates
+    registry._states["root-trans"] = RootLifecycleState.STOPPING
+
+    with pytest.raises(RegistryError, match="currently stopping"):
+        registry.start("root-trans")

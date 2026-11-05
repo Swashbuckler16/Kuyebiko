@@ -122,28 +122,42 @@ class RawFileNotification(BaseModel):
         old_path: str | None = None,
         new_path: str | None = None,
     ) -> FileEvent:
-        """Convert raw notification to a Phase 1 FileEvent domain model."""
+        """Convert raw notification to a Phase 1 FileEvent domain model.
+
+        Raises:
+            ValueError: If attempting to convert a rename action without both
+                old_path and new_path correlated.
+        """
         action_mapping = {
             WindowsFileAction.ADDED: EventType.CREATED,
             WindowsFileAction.MODIFIED: EventType.MODIFIED,
             WindowsFileAction.REMOVED: EventType.DELETED,
-            WindowsFileAction.RENAMED_OLD_NAME: EventType.RENAMED,
-            WindowsFileAction.RENAMED_NEW_NAME: EventType.RENAMED,
         }
 
-        event_type = action_mapping[self.action]
-        event_old_path = old_path
-        event_new_path = new_path
-
-        if event_type == EventType.RENAMED:
-            if not event_old_path:
-                event_old_path = self.relative_path
-            if not event_new_path:
-                event_new_path = self.relative_path
+        if self.action in (
+            WindowsFileAction.RENAMED_OLD_NAME,
+            WindowsFileAction.RENAMED_NEW_NAME,
+        ):
+            if not old_path or not new_path:
+                msg = (
+                    f"Cannot convert raw rename notification ({self.action.name}) "
+                    "to FileEvent without both old_path and new_path; raw rename "
+                    "notifications must be preserved until correlated by normalizer."
+                )
+                raise ValueError(msg)
+            event_type = EventType.RENAMED
+            event_path = new_path
+            event_old_path = old_path
+            event_new_path = new_path
+        else:
+            event_type = action_mapping[self.action]
+            event_path = self.relative_path
+            event_old_path = old_path
+            event_new_path = new_path
 
         return FileEvent(
             root_id=self.root_id,
-            file_path=self.relative_path,
+            file_path=event_path,
             event_type=event_type,
             old_path=event_old_path,
             new_path=event_new_path,

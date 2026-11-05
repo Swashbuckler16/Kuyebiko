@@ -6,7 +6,7 @@ from kuyebiko.collectors.models import (
     RawFileNotification,
     WindowsFileAction,
 )
-from kuyebiko.collectors.registry import MonitoredRootRegistry
+from kuyebiko.collectors.registry import MonitoredRootRegistry, RootLifecycleState
 from kuyebiko.collectors.windows import (
     ParsedNotification,
     WindowsDirectoryWatcher,
@@ -20,8 +20,8 @@ __all__ = [
     "NotificationCallback",
     "ParsedNotification",
     "RawFileNotification",
+    "RootLifecycleState",
     "WindowsDirectoryWatcher",
     "WindowsFileAction",
     "parse_file_notify_information",
 ]
-

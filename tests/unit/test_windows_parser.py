@@ -158,3 +158,24 @@ def test_parse_rejects_malformed_utf16_surrogate():
     with pytest.raises(BufferParseError, match="Failed to decode UTF-16LE"):
         parse_file_notify_information(header, len(header))
 
+
+def test_parse_rejects_negative_bytes_count():
+    with pytest.raises(BufferParseError, match="must be within"):
+        parse_file_notify_information(b"\x00" * 32, -1)
+
+
+def test_parse_rejects_bytes_count_exceeding_buffer():
+    with pytest.raises(BufferParseError, match="must be within"):
+        parse_file_notify_information(b"\x00" * 32, 64)
+
+
+def test_parse_rejects_leading_slash_path():
+    raw = make_entry(0, WindowsFileAction.ADDED, "/root_path/file.txt")
+    with pytest.raises(BufferParseError, match="Absolute path rejected"):
+        parse_file_notify_information(raw, len(raw))
+
+
+def test_parse_rejects_leading_backslash_path():
+    raw = make_entry(0, WindowsFileAction.ADDED, "\\Windows\\System32\\cmd.exe")
+    with pytest.raises(BufferParseError, match="Absolute path rejected"):
+        parse_file_notify_information(raw, len(raw))

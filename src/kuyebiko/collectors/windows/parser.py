@@ -32,6 +32,11 @@ def parse_file_notify_information(
         BufferParseError: If the buffer is truncated, offsets are out-of-bounds,
             or contains invalid action/length fields.
     """
+    if bytes_count < 0 or bytes_count > len(buffer):
+        raise BufferParseError(
+            f"Invalid bytes_count {bytes_count}: must be within [0, {len(buffer)}]"
+        )
+
     if bytes_count == 0:
         return []
 
@@ -95,7 +100,9 @@ def parse_file_notify_information(
         # Clean and normalize path
         normalized = filename.replace("\\", "/")
         if normalized.startswith("/"):
-            normalized = normalized.lstrip("/")
+            raise BufferParseError(
+                f"Absolute path rejected at offset {offset}: '{filename}'"
+            )
 
         if not normalized:
             raise BufferParseError(

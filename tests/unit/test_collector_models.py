@@ -199,3 +199,49 @@ def test_raw_notification_to_file_event():
     assert event.file_path == "documents/budget.xlsx"
     assert event.event_type == EventType.CREATED
     assert event.sequence_number == 10
+
+
+def test_rename_notification_to_file_event_requires_both_paths():
+    notif_old = RawFileNotification(
+        root_id="root-101",
+        relative_path="docs/draft.txt",
+        action=WindowsFileAction.RENAMED_OLD_NAME,
+        monotonic_ns=1000,
+    )
+    notif_new = RawFileNotification(
+        root_id="root-101",
+        relative_path="docs/final.txt",
+        action=WindowsFileAction.RENAMED_NEW_NAME,
+        monotonic_ns=2000,
+    )
+
+    # Calling to_file_event without both paths must fail with ValueError
+    with pytest.raises(ValueError, match="Cannot convert raw rename notification"):
+        notif_old.to_file_event()
+
+    with pytest.raises(ValueError, match="without both old_path and new_path"):
+        notif_old.to_file_event(old_path="docs/draft.txt")
+
+    with pytest.raises(ValueError, match="without both old_path and new_path"):
+        notif_new.to_file_event(new_path="docs/final.txt")
+
+
+def test_rename_notification_to_file_event_succeeds_with_both_paths():
+    notif_new = RawFileNotification(
+        root_id="root-101",
+        relative_path="docs/final.txt",
+        action=WindowsFileAction.RENAMED_NEW_NAME,
+        monotonic_ns=2000,
+    )
+
+    event = notif_new.to_file_event(
+        sequence_number=15,
+        old_path="docs/draft.txt",
+        new_path="docs/final.txt",
+    )
+
+    assert event.event_type == EventType.RENAMED
+    assert event.file_path == "docs/final.txt"
+    assert event.old_path == "docs/draft.txt"
+    assert event.new_path == "docs/final.txt"
+    assert event.sequence_number == 15
