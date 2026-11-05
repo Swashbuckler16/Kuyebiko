@@ -83,6 +83,7 @@ class RawFileNotification(BaseModel):
     action: WindowsFileAction
     observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     monotonic_ns: int = Field(ge=0)
+    is_directory: bool | None = None
 
     @field_validator("relative_path")
     @classmethod
@@ -161,6 +162,7 @@ class RawFileNotification(BaseModel):
             event_type=event_type,
             old_path=event_old_path,
             new_path=event_new_path,
+            is_directory=self.is_directory,
             timestamp_utc=self.observed_at,
             monotonic_ns=self.monotonic_ns,
             source=EventSource.WINDOWS_WATCHER,

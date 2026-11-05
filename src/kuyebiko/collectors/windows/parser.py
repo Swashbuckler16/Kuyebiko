@@ -13,6 +13,7 @@ class ParsedNotification:
 
     action: WindowsFileAction
     relative_path: str
+    is_directory: bool | None = None
 
 
 def parse_file_notify_information(

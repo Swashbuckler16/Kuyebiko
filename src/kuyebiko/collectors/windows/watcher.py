@@ -5,7 +5,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from kuyebiko.collectors.base import BaseWatcher
+from kuyebiko.collectors.base import BaseWatcher, WatcherHealth
 from kuyebiko.collectors.models import MonitoredRoot, RawFileNotification
 from kuyebiko.collectors.windows.api import (
     DEFAULT_BUFFER_SIZE,
@@ -23,6 +23,11 @@ from kuyebiko.collectors.windows.api import (
 )
 from kuyebiko.collectors.windows.parser import parse_file_notify_information
 from kuyebiko.core.exceptions import BufferParseError, WatcherError
+from kuyebiko.models.telemetry import (
+    CollectorStatus,
+    MonitoringStatus,
+    TelemetrySnapshot,
+)
 
 logger = logging.getLogger("kuyebiko.collectors.windows")
 
@@ -66,8 +71,18 @@ class WindowsDirectoryWatcher(BaseWatcher):
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
+        # Operational telemetry and degradation accounting
+        self._health: WatcherHealth = WatcherHealth.STOPPED
         self._degraded = False
         self._degradation_reason: str | None = None
+        self._degradation_history: list[str] = []
+        self._overflow_count = 0
+        self._gap_count = 0
+        self._malformed_buffer_count = 0
+        self._parser_failure_count = 0
+        self._events_observed = 0
+        self._last_event_at: datetime | None = None
+        self._last_recovered_at: datetime | None = None
 
     @property
     def root(self) -> MonitoredRoot:
@@ -78,18 +93,50 @@ class WindowsDirectoryWatcher(BaseWatcher):
         return self._root.root_id
 
     @property
+    def health(self) -> WatcherHealth:
+        with self._lock:
+            return self._health
+
+    @property
     def is_degraded(self) -> bool:
-        return self._degraded
+        with self._lock:
+            return self._degraded
 
     @property
     def degradation_reason(self) -> str | None:
-        return self._degradation_reason
+        with self._lock:
+            return self._degradation_reason
+
+    @property
+    def overflow_count(self) -> int:
+        with self._lock:
+            return self._overflow_count
+
+    @property
+    def gap_count(self) -> int:
+        with self._lock:
+            return self._gap_count
+
+    @property
+    def events_observed(self) -> int:
+        with self._lock:
+            return self._events_observed
+
+    @property
+    def malformed_buffer_count(self) -> int:
+        with self._lock:
+            return self._malformed_buffer_count
+
+    @property
+    def parser_failure_count(self) -> int:
+        with self._lock:
+            return self._parser_failure_count
 
     def is_running(self) -> bool:
         return self._is_running.is_set()
 
     def start(self) -> None:
-        """Start the background monitoring thread.
+        """Start the background monitoring thread transactionally.
 
         Raises:
             WatcherError: If monitoring is already active or cannot be started.
@@ -116,24 +163,56 @@ class WindowsDirectoryWatcher(BaseWatcher):
                     f"Failed to open directory handle for '{validated_path}': {err}"
                 ) from err
 
+            # Assign handle and reset shutdown controls
             self._handle = handle
             self._stop_event.clear()
-            self._is_running.set()
-            self._degraded = False
-            self._degradation_reason = None
 
-            self._thread = threading.Thread(
-                target=self._worker_loop,
-                name=f"kuyebiko-watcher-{self.root_id}",
-                daemon=True,
-            )
-            self._thread.start()
-            logger.info(
-                "Started native Windows watcher for root '%s' on '%s' (recursive=%s)",
-                self.root_id,
-                validated_path,
-                self._root.recursive,
-            )
+            # Transactional thread startup: if Thread.start() raises,
+            # we MUST close the newly opened directory handle to prevent leaks.
+            try:
+                thread = threading.Thread(
+                    target=self._worker_loop,
+                    name=f"kuyebiko-watcher-{self.root_id}",
+                    daemon=True,
+                )
+                thread.start()
+                self._thread = thread
+                self._is_running.set()
+                self._health = WatcherHealth.HEALTHY
+                logger.info(
+                    "Started native Windows watcher for root '%s' on '%s' (rec=%s)",
+                    self.root_id,
+                    validated_path,
+                    self._root.recursive,
+                )
+            except Exception as thread_err:
+                cleanup_err: Exception | None = None
+                try:
+                    close_directory_handle(handle)
+                    self._handle = None
+                except Exception as close_err:
+                    cleanup_err = close_err
+                    logger.critical(
+                        "Failed to close handle %d on thread start error for '%s': %s",
+                        handle,
+                        self.root_id,
+                        close_err,
+                    )
+
+                self._thread = None
+                self._is_running.clear()
+                if cleanup_err is not None:
+                    self._health = WatcherHealth.ERROR
+                    raise WatcherError(
+                        f"Thread start failed ({thread_err}) AND handle cleanup "
+                        f"failed ({cleanup_err}) for root '{self.root_id}'"
+                    ) from thread_err
+
+                self._health = WatcherHealth.STOPPED
+                raise WatcherError(
+                    f"Failed to start worker thread for root '{self.root_id}': "
+                    f"{thread_err}"
+                ) from thread_err
 
     def stop(self) -> None:
         """Cleanly cancel pending reads and stop the background monitoring thread.
@@ -171,11 +250,14 @@ class WindowsDirectoryWatcher(BaseWatcher):
 
             self._thread = None
             self._is_running.clear()
+            self._health = WatcherHealth.STOPPED
             logger.info("Stopped watcher for root '%s'", self.root_id)
 
     def _mark_degraded(self, reason: str) -> None:
         self._degraded = True
         self._degradation_reason = reason
+        self._degradation_history.append(f"[{datetime.now(UTC).isoformat()}] {reason}")
+        self._health = WatcherHealth.DEGRADED
         logger.warning(
             "Telemetry degraded for watcher '%s': %s",
             self.root_id,
@@ -208,31 +290,41 @@ class WindowsDirectoryWatcher(BaseWatcher):
                     break
 
                 if error_code == ERROR_NOTIFY_ENUM_DIR:
-                    self._mark_degraded(
-                        "Notification buffer overflow (ERROR_NOTIFY_ENUM_DIR). "
-                        "Filesystem events were dropped by Windows kernel."
-                    )
+                    with self._lock:
+                        self._overflow_count += 1
+                        self._gap_count += 1
+                        self._mark_degraded(
+                            "Notification buffer overflow (ERROR_NOTIFY_ENUM_DIR). "
+                            "Filesystem events were dropped by Windows kernel."
+                        )
+                    # Brief backoff to allow kernel buffer pressure to subside
+                    time.sleep(0.05)
                     continue
 
                 if error_code == ERROR_ACCESS_DENIED:
-                    self._mark_degraded(
-                        f"Access denied to monitored directory '{self._root.path}'"
-                    )
+                    with self._lock:
+                        self._health = WatcherHealth.ERROR
+                        self._mark_degraded(
+                            f"Access denied to monitored directory '{self._root.path}'"
+                        )
                     break
 
-                self._mark_degraded(
-                    f"ReadDirectoryChangesW failed with error code: {error_code}"
-                )
-                # Sleep briefly to prevent high CPU loop on persistent errors
+                with self._lock:
+                    self._health = WatcherHealth.ERROR
+                    self._mark_degraded(
+                        f"ReadDirectoryChangesW failed with error code: {error_code}"
+                    )
                 time.sleep(0.1)
                 continue
 
             # Zero bytes on success indicates possible buffer overflow
             if bytes_returned == 0:
-                self._mark_degraded(
-                    "ReadDirectoryChangesW returned 0 bytes with success. "
-                    "Notification buffer may have overflowed."
-                )
+                with self._lock:
+                    self._gap_count += 1
+                    self._mark_degraded(
+                        "ReadDirectoryChangesW returned 0 bytes with success. "
+                        "Notification buffer may have overflowed."
+                    )
                 continue
 
             # Capture accurate timing immediately upon receiving notifications
@@ -244,8 +336,21 @@ class WindowsDirectoryWatcher(BaseWatcher):
                     buffer.raw, bytes_returned
                 )
             except BufferParseError as err:
-                self._mark_degraded(f"Failed to parse notification buffer: {err}")
+                with self._lock:
+                    self._parser_failure_count += 1
+                    self._malformed_buffer_count += 1
+                    self._mark_degraded(f"Failed to parse notification buffer: {err}")
                 continue
+
+            # Successful reception and parse of notifications
+            with self._lock:
+                self._events_observed += len(parsed_entries)
+                self._last_event_at = observed_at
+                # If previously degraded and now successfully receiving again,
+                # mark collection recovery while preserving the historical gap
+                if self._degraded:
+                    self._last_recovered_at = observed_at
+                    self._health = WatcherHealth.HEALTHY
 
             for entry in parsed_entries:
                 try:
@@ -255,6 +360,7 @@ class WindowsDirectoryWatcher(BaseWatcher):
                         action=entry.action,
                         observed_at=observed_at,
                         monotonic_ns=monotonic_ns,
+                        is_directory=entry.is_directory,
                     )
                     self._dispatch(notification)
                 except Exception as err:
@@ -278,4 +384,42 @@ class WindowsDirectoryWatcher(BaseWatcher):
                 "Unhandled error in watcher callback for '%s': %s",
                 self.root_id,
                 err,
+            )
+
+    def get_telemetry_snapshot(self) -> TelemetrySnapshot:
+        """Generate an operational health TelemetrySnapshot for this watcher."""
+        with self._lock:
+            if self._health == WatcherHealth.DEGRADED:
+                mon_status = MonitoringStatus.DEGRADED
+                col_status = CollectorStatus.DEGRADED
+            elif self._health == WatcherHealth.ERROR:
+                mon_status = MonitoringStatus.ERROR
+                col_status = CollectorStatus.ERROR
+            elif self.is_running():
+                mon_status = MonitoringStatus.RUNNING
+                col_status = CollectorStatus.ACTIVE
+            else:
+                mon_status = MonitoringStatus.STOPPED
+                col_status = CollectorStatus.INACTIVE
+
+            # Build list of distinct non-empty degradation reasons
+            reasons: list[str] = []
+            if self._degradation_reason:
+                reasons.append(self._degradation_reason)
+            for item in self._degradation_history:
+                if item not in reasons:
+                    reasons.append(item)
+
+            return TelemetrySnapshot(
+                collector_id=f"windows-watcher-{self.root_id}",
+                root_id=self.root_id,
+                monitoring_status=mon_status,
+                collector_status=col_status,
+                events_received=self._events_observed,
+                events_dropped=0,  # Kernel overflow dropped count is unknown
+                collection_errors=self._overflow_count + self._parser_failure_count,
+                last_event_at=self._last_event_at,
+                last_heartbeat=datetime.now(UTC),
+                observed_at=datetime.now(UTC),
+                degradation_reasons=reasons,
             )

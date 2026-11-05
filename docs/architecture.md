@@ -106,18 +106,20 @@ src/kuyebiko/
   - `events.py` *(Implemented)*: Defines `FileEvent`, `EventType`, `EventSource`, and `TelemetryQuality` with strict validators against path traversal and malformed rename operations.
   - `incidents.py` *(Implemented)*: Defines `SecurityIncident`, `IncidentSeverity`, `IncidentConfidence`, and `IncidentStatus` with score boundaries (0–100) and chronological validation.
   - `telemetry.py` *(Implemented)*: Defines `TelemetrySnapshot`, `MonitoringStatus`, and `CollectorStatus` tracking queue depth, dropped events, and collector degradation.
-- **`collectors/`** *(Implemented — Phase 2)*:
-  - `models.py`: Pydantic models for `MonitoredRoot` (path validation, immutability), `RawFileNotification` (relative path normalization, timestamp validation, monotonic time attribution), and `WindowsFileAction`.
-  - `base.py`: `BaseWatcher` abstract base class defining lifecycle methods (`start()`, `stop()`, `is_running()`, telemetry flags, and callback registration).
+- **`collectors/`** *(Implemented — Phase 2 Complete)*:
+  - `models.py`: Pydantic models for `MonitoredRoot` (path validation, immutability), `RawFileNotification` (relative path normalization, timestamp validation, monotonic time attribution, `is_directory` flag), and `WindowsFileAction`.
+  - `base.py`: `BaseWatcher` abstract base class defining lifecycle methods (`start()`, `stop()`, `is_running()`, `WatcherHealth` state machine, degradation history, and `get_telemetry_snapshot()`).
   - `windows/api.py`: Win32 API declarations via standard library `ctypes` (`CreateFileW`, `ReadDirectoryChangesW`, `CancelIoEx`, `CloseHandle`) and safe fallback guards on non-Windows platforms.
   - `windows/parser.py`: Low-level binary parser for `FILE_NOTIFY_INFORMATION` structures supporting multibyte UTF-16LE, aligned offsets, Unicode filenames, backslash normalization, and bounds protection.
-  - `windows/watcher.py`: `WindowsDirectoryWatcher` background worker thread with `CancelIoEx` clean shutdown, `ERROR_NOTIFY_ENUM_DIR` buffer overflow detection, and telemetry degradation tracking.
-  - `registry.py`: `MonitoredRootRegistry` managing multi-root monitoring lifecycle (`start_all()`, `stop_all()`), concurrency locks, duplicate path rejection, and telemetry aggregation.
+  - `windows/watcher.py`: `WindowsDirectoryWatcher` background worker thread with `CancelIoEx` clean shutdown, transactional startup handle cleanup, `ERROR_NOTIFY_ENUM_DIR` buffer overflow detection, gap estimation, and telemetry degradation tracking.
+  - `rename_correlator.py`: `RenameCorrelator` thread-safe sliding window engine pairing `RENAMED_OLD_NAME` and `RENAMED_NEW_NAME` events with root isolation, pending capacity bounds, and timeout eviction.
+  - `normalizer.py`: `EventNormalizer` deterministic mapper transforming raw notifications into `FileEvent` schemas with monotonic sequence numbers, dual timestamps, and UUID identifiers.
+  - `registry.py`: `MonitoredRootRegistry` managing multi-root monitoring lifecycle (`start_all()`, `stop_all()`), concurrency locks, duplicate path rejection, transactional rollback, and telemetry aggregation.
   - *Architectural Limitation:* Windows filesystem change notifications (`ReadDirectoryChangesW`) report file mutation events but do **not** supply the originating process identifier (PID) or executable image path. Process attribution requires separate telemetry correlation (e.g., via ETW or Sysmon).
-- **`processing/`** *(Planned)*:
-  - Event normalization and monotonic sequence ordering.
-  - Bounded event queue with backpressure handling.
-  - Path canonicalization and exclusion filtering.
+- **`processing/`** *(Partially Implemented — Normalization active)*:
+  - Event normalization and monotonic sequence ordering (`EventNormalizer`).
+  - Bounded event queue with backpressure handling (Planned).
+  - Path canonicalization and exclusion filtering (Planned).
 - **`detection/`** *(Planned)*:
   - Sliding time-window correlation engine.
   - 10 behavioural signal evaluators (burst, rename/delete ratio, file diversity, etc.).

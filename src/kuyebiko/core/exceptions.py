@@ -23,3 +23,7 @@ class BufferParseError(CollectorError):
 
 class PathValidationError(CollectorError):
     """Raised when a path fails security or validation rules."""
+
+
+class NormalizationError(CollectorError, ValueError):
+    """Raised when a raw notification cannot be normalized into a valid FileEvent."""

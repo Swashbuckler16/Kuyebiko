@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 from tests.unit.test_windows_parser import make_entry
 
+from kuyebiko.collectors.base import WatcherHealth
 from kuyebiko.collectors.models import MonitoredRoot, WindowsFileAction
 from kuyebiko.collectors.windows.api import (
     ERROR_NOTIFY_ENUM_DIR,
@@ -13,6 +14,7 @@ from kuyebiko.collectors.windows.api import (
 )
 from kuyebiko.collectors.windows.watcher import WindowsDirectoryWatcher
 from kuyebiko.core.exceptions import WatcherError
+from kuyebiko.models.telemetry import CollectorStatus, MonitoringStatus
 
 
 def test_watcher_properties(tmp_path: Path):
@@ -24,6 +26,9 @@ def test_watcher_properties(tmp_path: Path):
     assert watcher.is_running() is False
     assert watcher.is_degraded is False
     assert watcher.degradation_reason is None
+    assert watcher.health == WatcherHealth.STOPPED
+    assert watcher.overflow_count == 0
+    assert watcher.gap_count == 0
 
 
 def test_watcher_duplicate_start_prevented(tmp_path: Path, monkeypatch):
@@ -56,6 +61,7 @@ def test_watcher_duplicate_start_prevented(tmp_path: Path, monkeypatch):
     try:
         watcher.start()
         assert watcher.is_running() is True
+        assert watcher.health == WatcherHealth.HEALTHY
 
         with pytest.raises(WatcherError, match="already running"):
             watcher.start()
@@ -63,6 +69,7 @@ def test_watcher_duplicate_start_prevented(tmp_path: Path, monkeypatch):
         hang_event.set()
         watcher.stop()
         assert watcher.is_running() is False
+        assert watcher.health == WatcherHealth.STOPPED
 
 
 def test_watcher_open_handle_failure(tmp_path: Path, monkeypatch):
@@ -81,6 +88,7 @@ def test_watcher_open_handle_failure(tmp_path: Path, monkeypatch):
         watcher.start()
 
     assert watcher.is_running() is False
+    assert watcher.health == WatcherHealth.STOPPED
 
 
 def test_watcher_dispatches_notification(tmp_path: Path, monkeypatch):
@@ -99,12 +107,11 @@ def test_watcher_dispatches_notification(tmp_path: Path, monkeypatch):
         if call_count == 1:
             buffer[: len(raw_buf)] = raw_buf
             return True, len(raw_buf), 0
-        # Subsequent call aborts loop
         return False, 0, ERROR_OPERATION_ABORTED
 
     monkeypatch.setattr(
         "kuyebiko.collectors.windows.watcher.open_directory_handle",
-        lambda p: 100,
+        lambda p: 4321,
     )
     monkeypatch.setattr(
         "kuyebiko.collectors.windows.watcher.read_directory_changes",
@@ -123,29 +130,28 @@ def test_watcher_dispatches_notification(tmp_path: Path, monkeypatch):
     try:
         watcher.start()
         time.sleep(0.1)
+        assert len(received) == 1
+        assert received[0].relative_path == "created_doc.txt"
+        assert received[0].action == WindowsFileAction.ADDED
+        assert watcher.events_observed == 1
     finally:
         watcher.stop()
 
-    assert len(received) == 1
-    assert received[0].root_id == "root-notify"
-    assert received[0].relative_path == "created_doc.txt"
-    assert received[0].action == WindowsFileAction.ADDED
-
 
 def test_watcher_handles_buffer_overflow_degradation(tmp_path: Path, monkeypatch):
-    root = MonitoredRoot(root_id="root-overflow", path=tmp_path)
+    root = MonitoredRoot(root_id="root-degraded", path=tmp_path)
     call_count = 0
 
     def mock_read(handle, buffer, buffer_length, recursive, notify_filter):
         nonlocal call_count
         call_count += 1
-        if call_count == 1:
+        if call_count <= 2:
             return False, 0, ERROR_NOTIFY_ENUM_DIR
         return False, 0, ERROR_OPERATION_ABORTED
 
     monkeypatch.setattr(
         "kuyebiko.collectors.windows.watcher.open_directory_handle",
-        lambda p: 100,
+        lambda p: 999,
     )
     monkeypatch.setattr(
         "kuyebiko.collectors.windows.watcher.read_directory_changes",
@@ -163,9 +169,11 @@ def test_watcher_handles_buffer_overflow_degradation(tmp_path: Path, monkeypatch
     watcher = WindowsDirectoryWatcher(root=root)
     try:
         watcher.start()
-        time.sleep(0.1)
+        time.sleep(0.15)
         assert watcher.is_degraded is True
         assert "ERROR_NOTIFY_ENUM_DIR" in watcher.degradation_reason
+        assert watcher.overflow_count >= 1
+        assert watcher.gap_count >= 1
     finally:
         watcher.stop()
 
@@ -206,7 +214,6 @@ def test_watcher_callback_exception_does_not_crash_thread(tmp_path: Path, monkey
     try:
         watcher.start()
         time.sleep(0.15)
-        # Verify the callback was called multiple times despite throwing
         assert callback_mock.call_count >= 1
     finally:
         watcher.stop()
@@ -216,7 +223,6 @@ def test_watcher_safe_repeated_stop(tmp_path: Path):
     root = MonitoredRoot(root_id="root-stop", path=tmp_path)
     watcher = WindowsDirectoryWatcher(root=root)
 
-    # Calling stop on stopped watcher should be safe
     watcher.stop()
     watcher.stop()
     assert watcher.is_running() is False
@@ -260,7 +266,6 @@ def test_watcher_stop_times_out_and_raises_without_closing_handle(
     )
 
     def mock_read(*args, **kwargs):
-        # Ignore cancellation initially to simulate hung I/O
         hang_in_read.wait(timeout=2.0)
         return False, 0, ERROR_OPERATION_ABORTED
 
@@ -277,12 +282,10 @@ def test_watcher_stop_times_out_and_raises_without_closing_handle(
         lambda h: closed_handles.append(h),
     )
 
-    # Monkeypatch thread.join to timeout immediately to keep test fast
     orig_join = threading.Thread.join
 
     def fast_timeout_join(thread_self, timeout=None):
         if not hang_in_join.is_set():
-            # Return while thread is still alive
             return
         orig_join(thread_self, timeout=timeout)
 
@@ -292,20 +295,17 @@ def test_watcher_stop_times_out_and_raises_without_closing_handle(
         watcher.start()
         assert watcher.is_running() is True
 
-        # Stop should fail, raise WatcherError, mark degraded, and NOT close handle
         with pytest.raises(WatcherError, match="failed to terminate within timeout"):
             watcher.stop()
 
         assert watcher.is_degraded is True
         assert "use-after-close" in watcher.degradation_reason
-        assert len(closed_handles) == 0  # Handle MUST NOT be closed!
+        assert len(closed_handles) == 0
 
-        # Now allow thread and join to complete normally
         hang_in_join.set()
         hang_in_read.set()
         time.sleep(0.05)
 
-        # Subsequent stop can now safely clean up
         watcher.stop()
         assert len(closed_handles) == 1
         assert closed_handles[0] == 777
@@ -313,3 +313,152 @@ def test_watcher_stop_times_out_and_raises_without_closing_handle(
     finally:
         hang_in_join.set()
         hang_in_read.set()
+
+
+def test_watcher_thread_start_failure_transactional_cleanup(
+    tmp_path: Path, monkeypatch
+):
+    root = MonitoredRoot(root_id="root-thread-fail", path=tmp_path)
+    watcher = WindowsDirectoryWatcher(root=root)
+
+    closed_handles = []
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.open_directory_handle",
+        lambda p: 888,
+    )
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.close_directory_handle",
+        lambda h: closed_handles.append(h),
+    )
+
+    def fail_thread_start(self):
+        raise RuntimeError("Out of system thread resources")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_thread_start)
+
+    with pytest.raises(WatcherError, match="Failed to start worker thread"):
+        watcher.start()
+
+    # Crucial assertion: Handle 888 MUST have been closed cleanly!
+    assert len(closed_handles) == 1
+    assert closed_handles[0] == 888
+    assert watcher.is_running() is False
+    assert watcher._handle is None
+    assert watcher.health == WatcherHealth.STOPPED
+
+
+def test_watcher_thread_start_failure_and_cleanup_failure(tmp_path: Path, monkeypatch):
+    root = MonitoredRoot(root_id="root-cleanup-fail", path=tmp_path)
+    watcher = WindowsDirectoryWatcher(root=root)
+
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.open_directory_handle",
+        lambda p: 888,
+    )
+
+    def fail_close(h):
+        raise OSError(6, "The handle is invalid")
+
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.close_directory_handle",
+        fail_close,
+    )
+
+    def fail_thread_start(self):
+        raise RuntimeError("Out of thread resources")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_thread_start)
+
+    with pytest.raises(WatcherError, match="AND handle cleanup failed"):
+        watcher.start()
+
+    # Watcher state must reflect ERROR and retain handle for recovery/inspection
+    assert watcher.health == WatcherHealth.ERROR
+    assert watcher._handle == 888
+
+
+def test_watcher_zero_bytes_success_marks_degraded(tmp_path: Path, monkeypatch):
+    root = MonitoredRoot(root_id="root-zero-bytes", path=tmp_path)
+    call_count = 0
+
+    def mock_read(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            return True, 0, 0
+        return False, 0, ERROR_OPERATION_ABORTED
+
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.open_directory_handle",
+        lambda p: 101,
+    )
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.read_directory_changes",
+        mock_read,
+    )
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.cancel_io_for_handle",
+        lambda h: True,
+    )
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.close_directory_handle",
+        lambda h: True,
+    )
+
+    watcher = WindowsDirectoryWatcher(root=root)
+    try:
+        watcher.start()
+        time.sleep(0.1)
+        assert watcher.is_degraded is True
+        assert watcher.gap_count >= 1
+    finally:
+        watcher.stop()
+
+
+def test_watcher_telemetry_snapshot_generation(tmp_path: Path, monkeypatch):
+    root = MonitoredRoot(root_id="root-snap", path=tmp_path)
+    watcher = WindowsDirectoryWatcher(root=root)
+
+    snap_stopped = watcher.get_telemetry_snapshot()
+    assert snap_stopped.root_id == "root-snap"
+    assert snap_stopped.monitoring_status == MonitoringStatus.STOPPED
+    assert snap_stopped.collector_status == CollectorStatus.INACTIVE
+
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.open_directory_handle",
+        lambda p: 101,
+    )
+    hang_event = threading.Event()
+
+    def mock_read(*args, **kwargs):
+        hang_event.wait(timeout=2.0)
+        return False, 0, ERROR_OPERATION_ABORTED
+
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.read_directory_changes",
+        mock_read,
+    )
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.cancel_io_for_handle",
+        lambda h: True,
+    )
+    monkeypatch.setattr(
+        "kuyebiko.collectors.windows.watcher.close_directory_handle",
+        lambda h: True,
+    )
+
+    try:
+        watcher.start()
+        snap_running = watcher.get_telemetry_snapshot()
+        assert snap_running.monitoring_status == MonitoringStatus.RUNNING
+        assert snap_running.collector_status == CollectorStatus.ACTIVE
+
+        # Mark degradation
+        watcher._mark_degraded("Simulated buffer overflow")
+        snap_deg = watcher.get_telemetry_snapshot()
+        assert snap_deg.monitoring_status == MonitoringStatus.DEGRADED
+        assert snap_deg.collector_status == CollectorStatus.DEGRADED
+        assert len(snap_deg.degradation_reasons) >= 1
+    finally:
+        hang_event.set()
+        watcher.stop()
