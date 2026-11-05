@@ -45,6 +45,11 @@ class TelemetrySnapshot(BaseModel):
     events_received: int = Field(default=0, ge=0)
     events_dropped: int = Field(default=0, ge=0)
 
+    # Uncertainty and gap quantification
+    uncounted_event_loss: bool = False
+    gap_count: int = Field(default=0, ge=0)
+    overflow_count: int = Field(default=0, ge=0)
+
     queue_capacity: int = Field(default=10000, ge=1)
     queue_depth: int = Field(default=0, ge=0)
 

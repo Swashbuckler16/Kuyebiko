@@ -67,9 +67,15 @@ Kuyebiko is actively under development. Below is the verified status of the code
 - **Centralized Diagnostic Logging (`src/kuyebiko/utils/logging_config.py`):**
   - Rotating file logger (`5 MB` max size, `5` backup archives) and stream console logger with clean formatting and shutdown handlers.
 - **Automated Test Suite (`tests/`):**
-  - **135 comprehensive unit tests** (`tests/unit/`) validating collector models, parser edge cases, native watcher thread lifecycle, rename correlator, normalizer, multi-root registry coordination, domain schemas, configuration, and logging.
+  - **144 comprehensive unit tests** (`tests/unit/`) validating collector models, parser edge cases, native watcher thread lifecycle, rename correlator, normalizer, multi-root registry coordination, domain schemas, configuration, and logging.
   - **13 integration tests** (`tests/integration/`) verifying live Windows `ReadDirectoryChangesW` filesystem events (file/directory CRUD, recursive vs. non-recursive, burst file mutations, shutdown during active concurrent I/O, multi-root directory isolation, end-to-end normalization pipeline, and async database WAL operations).
-  - **148 total passing tests** with **92% overall code coverage**.
+  - **157 total passing tests** with **91% overall code coverage**.
+
+> [!IMPORTANT]
+> **Windows Monitoring Architecture & Limitations:**
+> - **Telemetry Only:** Phase 2 provides an audit-hardened filesystem telemetry ingestion foundation. It does *not* execute ransomware detection, scoring rules, or automated remediation; detection correlation is scheduled for Phase 3.
+> - **Notification-Based Semantics:** Windows `ReadDirectoryChangesW` is a notification mechanism, not a guaranteed lossless audit log. Under extreme I/O burst pressure, OS buffers can overflow (`ERROR_NOTIFY_ENUM_DIR`). Kuyebiko captures this uncertainty through explicit `WatcherHealth.DEGRADED` states, `uncounted_event_loss` flags, and `gap_count` metrics.
+> - **No Process Attribution:** Win32 filesystem notifications identify file path mutations but do *not* report the originating process identifier (PID) or executable image path. Process attribution will be introduced in subsequent phases via ETW/Sysmon adapters.
 
 ### Partially Implemented Functionality
 - **Package Architecture:** Modular package structure established under `src/kuyebiko/` with package initializers (`processing`, `detection`, `integrity`, `application`).

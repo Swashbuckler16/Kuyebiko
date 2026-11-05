@@ -11,6 +11,7 @@ from kuyebiko.collectors.windows.api import (
     DEFAULT_BUFFER_SIZE,
     DEFAULT_NOTIFY_FILTER,
     ERROR_ACCESS_DENIED,
+    ERROR_INVALID_HANDLE,
     ERROR_NOTIFY_ENUM_DIR,
     ERROR_OPERATION_ABORTED,
     MAX_BUFFER_SIZE,
@@ -70,6 +71,7 @@ class WindowsDirectoryWatcher(BaseWatcher):
         self._is_running = threading.Event()
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        self._stop_lock = threading.Lock()
 
         # Operational telemetry and degradation accounting
         self._health: WatcherHealth = WatcherHealth.STOPPED
@@ -135,6 +137,13 @@ class WindowsDirectoryWatcher(BaseWatcher):
     def is_running(self) -> bool:
         return self._is_running.is_set()
 
+    def has_active_resources(self) -> bool:
+        """Return True if native resources (OS handle or thread) remain allocated."""
+        with self._lock:
+            handle_active = self._handle is not None and is_valid_handle(self._handle)
+            thread_active = self._thread is not None and self._thread.is_alive()
+            return handle_active or thread_active
+
     def start(self) -> None:
         """Start the background monitoring thread transactionally.
 
@@ -163,22 +172,23 @@ class WindowsDirectoryWatcher(BaseWatcher):
                     f"Failed to open directory handle for '{validated_path}': {err}"
                 ) from err
 
-            # Assign handle and reset shutdown controls
+            # Safely initialize state BEFORE the worker thread starts executing
             self._handle = handle
             self._stop_event.clear()
+            self._is_running.set()
+            self._health = WatcherHealth.HEALTHY
+
+            thread = threading.Thread(
+                target=self._worker_loop,
+                name=f"kuyebiko-watcher-{self.root_id}",
+                daemon=True,
+            )
+            self._thread = thread
 
             # Transactional thread startup: if Thread.start() raises,
             # we MUST close the newly opened directory handle to prevent leaks.
             try:
-                thread = threading.Thread(
-                    target=self._worker_loop,
-                    name=f"kuyebiko-watcher-{self.root_id}",
-                    daemon=True,
-                )
                 thread.start()
-                self._thread = thread
-                self._is_running.set()
-                self._health = WatcherHealth.HEALTHY
                 logger.info(
                     "Started native Windows watcher for root '%s' on '%s' (rec=%s)",
                     self.root_id,
@@ -186,21 +196,32 @@ class WindowsDirectoryWatcher(BaseWatcher):
                     self._root.recursive,
                 )
             except Exception as thread_err:
+                self._thread = None
+                self._is_running.clear()
+
                 cleanup_err: Exception | None = None
                 try:
-                    close_directory_handle(handle)
-                    self._handle = None
+                    closed = close_directory_handle(handle)
+                    if closed:
+                        self._handle = None
+                    else:
+                        cleanup_err = OSError(
+                            f"CloseHandle returned FALSE for handle {handle}"
+                        )
+                        logger.critical(
+                            "CloseHandle failed for handle %d on '%s'",
+                            handle,
+                            self.root_id,
+                        )
                 except Exception as close_err:
                     cleanup_err = close_err
                     logger.critical(
-                        "Failed to close handle %d on thread start error for '%s': %s",
+                        "Exception closing handle %d for '%s': %s",
                         handle,
                         self.root_id,
                         close_err,
                     )
 
-                self._thread = None
-                self._is_running.clear()
                 if cleanup_err is not None:
                     self._health = WatcherHealth.ERROR
                     raise WatcherError(
@@ -217,56 +238,100 @@ class WindowsDirectoryWatcher(BaseWatcher):
     def stop(self) -> None:
         """Cleanly cancel pending reads and stop the background monitoring thread.
 
+        Thread-safe against concurrent stop invocations.
+
         Raises:
-            WatcherError: If the worker thread fails to terminate within the timeout.
+            WatcherError: If the worker thread fails to terminate within the timeout
+                or if closing the native handle fails.
         """
-        with self._lock:
-            if not self.is_running() and self._thread is None:
-                return
+        with self._stop_lock:
+            with self._lock:
+                # If neither running nor holding resources, nothing to stop
+                if (
+                    not self.is_running()
+                    and self._thread is None
+                    and (self._handle is None or not is_valid_handle(self._handle))
+                ):
+                    return
 
-            self._stop_event.set()
+                self._stop_event.set()
+                target_handle = self._handle
+                target_thread = self._thread
 
-            # Signal cancellation to any pending ReadDirectoryChangesW call
-            if self._handle is not None and is_valid_handle(self._handle):
-                cancel_io_for_handle(self._handle)
+                # Signal cancellation to any pending ReadDirectoryChangesW call
+                if target_handle is not None and is_valid_handle(target_handle):
+                    cancel_io_for_handle(target_handle)
 
-        # Wait for worker thread outside the lock to avoid deadlock
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=5.0)
-            if self._thread.is_alive():
-                self._mark_degraded(
-                    f"Watcher thread for root '{self.root_id}' did not terminate "
-                    "within timeout; handle retained to prevent use-after-close race."
-                )
-                raise WatcherError(
-                    f"Watcher thread for root '{self.root_id}' failed to terminate "
-                    "within timeout; handle retained to prevent use-after-close race."
-                )
+            # Wait for worker thread outside the state lock to avoid deadlock
+            if target_thread is not None and target_thread.is_alive():
+                target_thread.join(timeout=5.0)
+                if target_thread.is_alive():
+                    msg = (
+                        f"Watcher thread for root '{self.root_id}' failed to terminate "
+                        "within timeout; handle retained to prevent use-after-close."
+                    )
+                    self._mark_degraded(msg, is_error=True)
+                    raise WatcherError(msg)
 
-        with self._lock:
-            if self._handle is not None and is_valid_handle(self._handle):
-                close_directory_handle(self._handle)
-                self._handle = None
+            with self._lock:
+                self._thread = None
+                self._is_running.clear()
 
-            self._thread = None
-            self._is_running.clear()
-            self._health = WatcherHealth.STOPPED
-            logger.info("Stopped watcher for root '%s'", self.root_id)
+                # Cleanly close the directory handle
+                if self._handle is not None and is_valid_handle(self._handle):
+                    handle_val = self._handle
+                    try:
+                        closed = close_directory_handle(handle_val)
+                    except Exception as err:
+                        msg = (
+                            f"Error closing handle {handle_val} for '{self.root_id}': "
+                            f"{err}"
+                        )
+                        self._mark_degraded(msg, is_error=True)
+                        raise WatcherError(
+                            f"Exception closing handle for root '{self.root_id}': {err}"
+                        ) from err
 
-    def _mark_degraded(self, reason: str) -> None:
+                    if closed:
+                        self._handle = None
+                        if self._health != WatcherHealth.ERROR:
+                            self._health = WatcherHealth.STOPPED
+                        logger.info("Stopped watcher for root '%s'", self.root_id)
+                    else:
+                        # Retain handle reference for later retry!
+                        msg = (
+                            f"CloseHandle failed on handle {handle_val} for "
+                            f"'{self.root_id}'"
+                        )
+                        self._mark_degraded(msg, is_error=True)
+                        raise WatcherError(
+                            f"CloseHandle failed for root '{self.root_id}'"
+                        )
+                else:
+                    if self._health != WatcherHealth.ERROR:
+                        self._health = WatcherHealth.STOPPED
+                    logger.info("Stopped watcher for root '%s'", self.root_id)
+
+    def _mark_degraded(self, reason: str, is_error: bool = False) -> None:
         self._degraded = True
         self._degradation_reason = reason
         self._degradation_history.append(f"[{datetime.now(UTC).isoformat()}] {reason}")
-        self._health = WatcherHealth.DEGRADED
-        logger.warning(
-            "Telemetry degraded for watcher '%s': %s",
-            self.root_id,
-            reason,
-        )
+        if is_error:
+            self._health = WatcherHealth.ERROR
+            logger.error("Error recorded for watcher '%s': %s", self.root_id, reason)
+        else:
+            if self._health != WatcherHealth.ERROR:
+                self._health = WatcherHealth.DEGRADED
+            logger.warning(
+                "Telemetry degraded for watcher '%s': %s",
+                self.root_id,
+                reason,
+            )
 
     def _worker_loop(self) -> None:
         """Dedicated background thread loop polling ReadDirectoryChangesW."""
         buffer = ctypes.create_string_buffer(self._buffer_size)
+        consecutive_errors = 0
 
         while not self._stop_event.is_set():
             if self._handle is None or not is_valid_handle(self._handle):
@@ -286,10 +351,11 @@ class WindowsDirectoryWatcher(BaseWatcher):
 
             if not success:
                 if error_code == ERROR_OPERATION_ABORTED:
-                    # CancelIoEx was called
+                    # CancelIoEx was called for clean shutdown
                     break
 
                 if error_code == ERROR_NOTIFY_ENUM_DIR:
+                    consecutive_errors = 0
                     with self._lock:
                         self._overflow_count += 1
                         self._gap_count += 1
@@ -301,23 +367,36 @@ class WindowsDirectoryWatcher(BaseWatcher):
                     time.sleep(0.05)
                     continue
 
-                if error_code == ERROR_ACCESS_DENIED:
+                if error_code in (ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE):
                     with self._lock:
-                        self._health = WatcherHealth.ERROR
                         self._mark_degraded(
-                            f"Access denied to monitored directory '{self._root.path}'"
+                            f"Fatal error ({error_code}) on '{self._root.path}'",
+                            is_error=True,
                         )
                     break
 
+                consecutive_errors += 1
                 with self._lock:
-                    self._health = WatcherHealth.ERROR
                     self._mark_degraded(
-                        f"ReadDirectoryChangesW failed with error code: {error_code}"
+                        f"ReadDirectoryChangesW failed with error code: {error_code}",
+                        is_error=(consecutive_errors >= 3),
                     )
-                time.sleep(0.1)
+
+                if consecutive_errors >= 3:
+                    logger.critical(
+                        "Terminating worker for '%s' after %d unexpected errors",
+                        self.root_id,
+                        consecutive_errors,
+                    )
+                    break
+
+                # Bounded backoff for transient unexpected errors
+                time.sleep(0.05 * consecutive_errors)
                 continue
 
-            # Zero bytes on success indicates possible buffer overflow
+            consecutive_errors = 0
+
+            # Zero bytes on success indicates possible buffer overflow / gap
             if bytes_returned == 0:
                 with self._lock:
                     self._gap_count += 1
@@ -346,9 +425,8 @@ class WindowsDirectoryWatcher(BaseWatcher):
             with self._lock:
                 self._events_observed += len(parsed_entries)
                 self._last_event_at = observed_at
-                # If previously degraded and now successfully receiving again,
-                # mark collection recovery while preserving the historical gap
-                if self._degraded:
+                # Only recover to HEALTHY if not in fatal ERROR state
+                if self._degraded and self._health != WatcherHealth.ERROR:
                     self._last_recovered_at = observed_at
                     self._health = WatcherHealth.HEALTHY
 
@@ -416,7 +494,10 @@ class WindowsDirectoryWatcher(BaseWatcher):
                 monitoring_status=mon_status,
                 collector_status=col_status,
                 events_received=self._events_observed,
-                events_dropped=0,  # Kernel overflow dropped count is unknown
+                events_dropped=0,  # Exact drop count is unknown; kernel does not count
+                uncounted_event_loss=(self._overflow_count > 0 or self._gap_count > 0),
+                gap_count=self._gap_count,
+                overflow_count=self._overflow_count,
                 collection_errors=self._overflow_count + self._parser_failure_count,
                 last_event_at=self._last_event_at,
                 last_heartbeat=datetime.now(UTC),

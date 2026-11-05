@@ -60,6 +60,10 @@ class BaseWatcher(ABC):
     def degradation_reason(self) -> str | None:
         """Return diagnostic explanation if the watcher is in a degraded state."""
 
+    def has_active_resources(self) -> bool:
+        """Return True if native resources (e.g. OS handle, thread) remain allocated."""
+        return self.is_running()
+
     @property
     def health(self) -> WatcherHealth:
         """Return current operational health state."""
@@ -82,12 +86,19 @@ class BaseWatcher(ABC):
 
     def get_telemetry_snapshot(self) -> TelemetrySnapshot:
         """Return a TelemetrySnapshot model capturing the current health state."""
-        mon_status = (
-            MonitoringStatus.RUNNING if self.is_running() else MonitoringStatus.STOPPED
-        )
-        col_status = (
-            CollectorStatus.ACTIVE if self.is_running() else CollectorStatus.INACTIVE
-        )
+        if self.health == WatcherHealth.DEGRADED:
+            mon_status = MonitoringStatus.DEGRADED
+            col_status = CollectorStatus.DEGRADED
+        elif self.health == WatcherHealth.ERROR:
+            mon_status = MonitoringStatus.ERROR
+            col_status = CollectorStatus.ERROR
+        elif self.is_running():
+            mon_status = MonitoringStatus.RUNNING
+            col_status = CollectorStatus.ACTIVE
+        else:
+            mon_status = MonitoringStatus.STOPPED
+            col_status = CollectorStatus.INACTIVE
+
         reasons = [self.degradation_reason] if self.degradation_reason else []
 
         return TelemetrySnapshot(
@@ -97,6 +108,9 @@ class BaseWatcher(ABC):
             collector_status=col_status,
             events_received=self.events_observed,
             events_dropped=0,
+            uncounted_event_loss=(self.overflow_count > 0 or self.gap_count > 0),
+            gap_count=self.gap_count,
+            overflow_count=self.overflow_count,
             collection_errors=self.overflow_count,
             degradation_reasons=reasons,
         )

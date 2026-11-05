@@ -21,6 +21,7 @@ class RootLifecycleState(Enum):
     STARTING = auto()
     RUNNING = auto()
     STOPPING = auto()
+    ERROR = auto()
 
 
 def _default_watcher_factory(
@@ -99,7 +100,7 @@ class MonitoredRootRegistry:
 
         Raises:
             RegistryError: If root_id is not registered, currently starting or stopping,
-                or if stopping the active watcher fails.
+                or if stopping the active watcher fails or retains active resources.
         """
         watcher_to_stop: BaseWatcher | None = None
 
@@ -129,8 +130,6 @@ class MonitoredRootRegistry:
                 watcher_to_stop.stop()
             except Exception as err:
                 with self._lock:
-                    # Watcher failed to stop! Retain the root and watcher in RUNNING
-                    # state to prevent losing track of a live thread or handle.
                     if root_id in self._roots:
                         self._states[root_id] = RootLifecycleState.RUNNING
                 logger.error(
@@ -142,6 +141,15 @@ class MonitoredRootRegistry:
                     f"Failed to stop watcher for root '{root_id}' "
                     f"during unregister: {err}"
                 ) from err
+
+            # Verify that watcher released all native resources
+            if watcher_to_stop.has_active_resources():
+                with self._lock:
+                    if root_id in self._roots:
+                        self._states[root_id] = RootLifecycleState.ERROR
+                raise RegistryError(
+                    f"Cannot unregister root '{root_id}': active resources remain"
+                )
 
         # Only clean up root from registry after watcher has stopped successfully
         with self._lock:
@@ -160,7 +168,7 @@ class MonitoredRootRegistry:
             root_id: Identifier of the root to start.
 
         Raises:
-            RegistryError: If the root is unknown, disabled, or not in STOPPED state,
+            RegistryError: If the root is unknown, disabled, already active or in error,
                 or if the watcher factory or watcher startup fails.
         """
         with self._lock:
@@ -172,7 +180,11 @@ class MonitoredRootRegistry:
                 raise RegistryError(f"Cannot start disabled root '{root_id}'")
 
             state = self._states.get(root_id, RootLifecycleState.STOPPED)
-            if state in (RootLifecycleState.STARTING, RootLifecycleState.RUNNING):
+            if state in (
+                RootLifecycleState.STARTING,
+                RootLifecycleState.RUNNING,
+                RootLifecycleState.ERROR,
+            ):
                 raise RegistryError(
                     f"Watcher for root '{root_id}' is already {state.name.lower()}"
                 )
@@ -192,15 +204,27 @@ class MonitoredRootRegistry:
                 watcher.start()
                 self._states[root_id] = RootLifecycleState.RUNNING
             except Exception as err:
-                self._watchers.pop(root_id, None)
-                self._states[root_id] = RootLifecycleState.STOPPED
+                watcher = self._watchers.get(root_id)
+                if watcher is not None and watcher.has_active_resources():
+                    # Retain watcher in ERROR state to prevent resource leak
+                    # and prevent duplicate watchers on this root.
+                    self._states[root_id] = RootLifecycleState.ERROR
+                    logger.critical(
+                        "Watcher start failed for root '%s' with active resources: %s",
+                        root_id,
+                        err,
+                    )
+                else:
+                    self._watchers.pop(root_id, None)
+                    self._states[root_id] = RootLifecycleState.STOPPED
+
                 logger.error("Failed to start watcher for root '%s': %s", root_id, err)
                 raise RegistryError(
                     f"Failed to start watcher for root '{root_id}': {err}"
                 ) from err
 
     def stop(self, root_id: str) -> None:
-        """Stop monitoring for a specific root.
+        """Stop monitoring for a specific root, or retry cleanup if in ERROR state.
 
         Args:
             root_id: Identifier of the root to stop.
@@ -230,8 +254,6 @@ class MonitoredRootRegistry:
                 watcher_to_stop.stop()
             except Exception as err:
                 with self._lock:
-                    # Watcher failed to stop! Retain it in RUNNING state
-                    # so we don't lose track of it or allow starting a duplicate.
                     if root_id in self._roots:
                         self._states[root_id] = RootLifecycleState.RUNNING
                 logger.error(
@@ -243,11 +265,15 @@ class MonitoredRootRegistry:
                     f"Failed to stop watcher for root '{root_id}': {err}"
                 ) from err
 
-            # Only on successful stop:
+            # Evaluate whether cleanup was completely successful
             with self._lock:
-                if root_id in self._roots:
-                    self._states[root_id] = RootLifecycleState.STOPPED
-                self._watchers.pop(root_id, None)
+                if watcher_to_stop.has_active_resources():
+                    if root_id in self._roots:
+                        self._states[root_id] = RootLifecycleState.ERROR
+                else:
+                    if root_id in self._roots:
+                        self._states[root_id] = RootLifecycleState.STOPPED
+                    self._watchers.pop(root_id, None)
         else:
             with self._lock:
                 if root_id in self._roots:
@@ -279,7 +305,7 @@ class MonitoredRootRegistry:
         return results
 
     def stop_all(self) -> None:
-        """Stop all currently active watchers.
+        """Stop all currently active or resource-holding watchers.
 
         Raises:
             RegistryError: If any watcher fails to stop.
@@ -288,7 +314,8 @@ class MonitoredRootRegistry:
 
         with self._lock:
             for root_id, watcher in list(self._watchers.items()):
-                if self._states.get(root_id) == RootLifecycleState.RUNNING:
+                state = self._states.get(root_id)
+                if state in (RootLifecycleState.RUNNING, RootLifecycleState.ERROR):
                     self._states[root_id] = RootLifecycleState.STOPPING
                     watchers_to_stop.append((root_id, watcher))
 
@@ -308,9 +335,14 @@ class MonitoredRootRegistry:
                         self._states[root_id] = RootLifecycleState.RUNNING
             else:
                 with self._lock:
-                    if root_id in self._roots:
-                        self._states[root_id] = RootLifecycleState.STOPPED
-                    self._watchers.pop(root_id, None)
+                    if watcher.has_active_resources():
+                        if root_id in self._roots:
+                            self._states[root_id] = RootLifecycleState.ERROR
+                        failed_roots.append(root_id)
+                    else:
+                        if root_id in self._roots:
+                            self._states[root_id] = RootLifecycleState.STOPPED
+                        self._watchers.pop(root_id, None)
 
         if failed_roots:
             raise RegistryError(

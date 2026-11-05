@@ -200,3 +200,93 @@ def test_correlator_clear():
 
     correlator.clear("r1")
     assert correlator.pending_count("r1") == 0
+
+
+def test_correlator_avoids_mismatch_when_orphan_move_out_precedes_rename():
+    """Ensure an orphan move-out does not cause renames to miscorrelate."""
+    correlator = RenameCorrelator(correlation_window_ns=1_000_000_000)
+
+    # 1. File moved out of monitored root at t=100_000 ns (no NEW_NAME arrives)
+    old_move_out = RawFileNotification(
+        root_id="r1",
+        relative_path="moved_away.txt",
+        action=WindowsFileAction.RENAMED_OLD_NAME,
+        monotonic_ns=100_000,
+    )
+    correlator.process_notification(old_move_out)
+    assert correlator.pending_count("r1") == 1
+
+    # 2. Later at t=500_000 ns, an in-place rename occurs
+    old_rename = RawFileNotification(
+        root_id="r1",
+        relative_path="source_doc.txt",
+        action=WindowsFileAction.RENAMED_OLD_NAME,
+        monotonic_ns=500_000,
+    )
+    new_rename = RawFileNotification(
+        root_id="r1",
+        relative_path="dest_doc.txt",
+        action=WindowsFileAction.RENAMED_NEW_NAME,
+        monotonic_ns=500_010,
+    )
+
+    correlator.process_notification(old_rename)
+    assert correlator.pending_count("r1") == 2
+
+    # 3. Must match old_rename (closest in time), NOT moved_away.txt!
+    result = correlator.process_notification(new_rename)
+    assert result is not None
+    assert result.old_path == "source_doc.txt"
+    assert result.new_path == "dest_doc.txt"
+
+    # moved_away.txt remains in queue until evicted
+    assert correlator.pending_count("r1") == 1
+    evicted = correlator.evict_expired(current_monotonic_ns=1_200_000_000)
+    assert len(evicted) == 1
+    assert evicted[0].relative_path == "moved_away.txt"
+    assert correlator.pending_count("r1") == 0
+
+
+def test_correlator_multiple_rapid_renames():
+    """Verify multiple rapid renames pair correctly based on proximity."""
+    correlator = RenameCorrelator()
+
+    old_a = RawFileNotification(
+        root_id="r1",
+        relative_path="sub1/a_old.txt",
+        action=WindowsFileAction.RENAMED_OLD_NAME,
+        monotonic_ns=1_000,
+    )
+    old_b = RawFileNotification(
+        root_id="r1",
+        relative_path="sub2/b_old.txt",
+        action=WindowsFileAction.RENAMED_OLD_NAME,
+        monotonic_ns=2_000,
+    )
+    correlator.process_notification(old_a)
+    correlator.process_notification(old_b)
+
+    # new_b arrives
+    new_b = RawFileNotification(
+        root_id="r1",
+        relative_path="sub2/b_new.txt",
+        action=WindowsFileAction.RENAMED_NEW_NAME,
+        monotonic_ns=2_010,
+    )
+    res_b = correlator.process_notification(new_b)
+    assert res_b is not None
+    assert res_b.old_path == "sub2/b_old.txt"
+    assert res_b.new_path == "sub2/b_new.txt"
+
+    # new_a arrives
+    new_a = RawFileNotification(
+        root_id="r1",
+        relative_path="sub1/a_new.txt",
+        action=WindowsFileAction.RENAMED_NEW_NAME,
+        monotonic_ns=2_050,
+    )
+    res_a = correlator.process_notification(new_a)
+    assert res_a is not None
+    assert res_a.old_path == "sub1/a_old.txt"
+    assert res_a.new_path == "sub1/a_new.txt"
+    assert correlator.pending_count("r1") == 0

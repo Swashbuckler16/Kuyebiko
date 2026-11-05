@@ -399,3 +399,59 @@ def test_registry_stop_all_failure_retains_failing_watcher(tmp_path: Path):
     # r2 failed to stop and remains RUNNING in registry
     assert registry.get_state("r2") == RootLifecycleState.RUNNING
     assert registry.get_watcher("r2") is not None
+
+
+def test_registry_startup_cleanup_failure_retains_watcher(tmp_path: Path):
+    """Test scenario for Task 2.2:
+    1. Registry creates watcher.
+    2. Watcher opens handle.
+    3. Thread startup fails.
+    4. Handle cleanup fails.
+    5. Registry receives the exception.
+    6. Registry must retain the watcher in ERROR state.
+    7. Registry must prevent a duplicate watcher from starting.
+    8. A later cleanup retry must be possible.
+    """
+
+    class ResourceLeakingStartupWatcher(DummyWatcher):
+        def __init__(self, root, callback):
+            super().__init__(root, callback)
+            self._has_resources = False
+
+        def has_active_resources(self) -> bool:
+            return self._has_resources
+
+        def start(self) -> None:
+            # Simulate handle opened and thread startup failed + cleanup failed
+            self._has_resources = True
+            raise RuntimeError("Thread start failed and CloseHandle failed")
+
+        def stop(self) -> None:
+            # Cleanup retry succeeds
+            self._has_resources = False
+            self._running = False
+
+    registry = MonitoredRootRegistry(
+        watcher_factory=lambda r, cb: ResourceLeakingStartupWatcher(r, cb)
+    )
+    root = MonitoredRoot(root_id="leak-test", path=tmp_path)
+    registry.register(root)
+
+    # Step 5: Registry receives exception on start()
+    with pytest.raises(RegistryError, match="Thread start failed"):
+        registry.start("leak-test")
+
+    # Step 6: Registry must retain the watcher in ERROR state
+    assert registry.get_state("leak-test") == RootLifecycleState.ERROR
+    leaked_watcher = registry.get_watcher("leak-test")
+    assert leaked_watcher is not None
+    assert leaked_watcher.has_active_resources() is True
+
+    # Step 7: Registry must prevent duplicate watcher from starting
+    with pytest.raises(RegistryError, match="already error"):
+        registry.start("leak-test")
+
+    # Step 8: A later cleanup retry must be possible via stop()
+    registry.stop("leak-test")
+    assert registry.get_state("leak-test") == RootLifecycleState.STOPPED
+    assert registry.get_watcher("leak-test") is None
