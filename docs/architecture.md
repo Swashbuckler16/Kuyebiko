@@ -62,10 +62,10 @@ The following components are planned for subsequent implementation stages:
 
 | Technology | Role | Status |
 | :--- | :--- | :--- |
-| **Windows API (`ReadDirectoryChangesW`)** | High-throughput directory change notifications via ctypes/win32 | Planned (Phase 1/2) |
+| **Windows API (`ReadDirectoryChangesW`)** | High-throughput directory change notifications via ctypes/win32 | Implemented (Phase 2) |
 | **Windows Service Control Manager (SCM)** | Background service execution, auto-recovery, and watchdog supervision | Planned (Phase 4) |
 | **Sysmon / ETW Adapters** | Optional process attribution and recovery-interference telemetry | Planned (Phase 2+) |
-| **PySide6 (Qt for Python)** | Local desktop user interface, real-time dashboard, and incident viewer | Planned (Phase 3) |
+| **PySide6 (Qt for Python)** | Local desktop user interface, real-time dashboard, and incident viewer | Planned (Phase 4) |
 | **Cryptographic Hash Chaining** | SHA-256 tamper-evident chaining across persisted incident records | Planned (Phase 4) |
 
 ---
@@ -81,6 +81,13 @@ src/kuyebiko/
 ├── core/                # Central configuration, constants, exceptions
 ├── models/              # Pydantic schemas for events, incidents, telemetry
 ├── collectors/          # Filesystem and OS telemetry collection adapters
+│   ├── base.py          # Abstract BaseWatcher interface
+│   ├── models.py        # MonitoredRoot, RawFileNotification, WindowsFileAction
+│   ├── registry.py      # MonitoredRootRegistry for multi-root coordination
+│   └── windows/         # Native Windows collectors
+│       ├── api.py       # Win32 ctypes signatures, constants, and fallback guards
+│       ├── parser.py    # FILE_NOTIFY_INFORMATION byte parser and validator
+│       └── watcher.py   # WindowsDirectoryWatcher background worker thread
 ├── processing/          # Ingestion queue, normalizer, and event deduplication
 ├── detection/           # Rolling window correlation and signal scoring engines
 ├── storage/             # SQLite connection management and database migrations
@@ -94,15 +101,19 @@ src/kuyebiko/
 - **`core/`**:
   - `config.py` *(Implemented)*: Houses `KuyebikoSettings`, handling application settings, database paths, queue limits, retention policies, and logging levels via `pydantic-settings`.
   - `constants.py` *(Planned)*: Shared constants, default weights, and threshold bounds.
-  - `exceptions.py` *(Planned)*: Domain-specific exceptions (`CollectionError`, `IntegrityError`, etc.).
+  - `exceptions.py` *(Implemented)*: Domain-specific exceptions (`KuyebikoError`, `CollectorError`, `WatcherError`, `RegistryError`, `BufferParseError`, `PathValidationError`).
 - **`models/`**:
   - `events.py` *(Implemented)*: Defines `FileEvent`, `EventType`, `EventSource`, and `TelemetryQuality` with strict validators against path traversal and malformed rename operations.
   - `incidents.py` *(Implemented)*: Defines `SecurityIncident`, `IncidentSeverity`, `IncidentConfidence`, and `IncidentStatus` with score boundaries (0–100) and chronological validation.
   - `telemetry.py` *(Implemented)*: Defines `TelemetrySnapshot`, `MonitoringStatus`, and `CollectorStatus` tracking queue depth, dropped events, and collector degradation.
-- **`collectors/`** *(Planned)*:
-  - Directory watcher based on Windows `ReadDirectoryChangesW`.
-  - Bounded ring buffers and overflow accounting.
-  - Optional adapters for external process telemetry (e.g., Sysmon).
+- **`collectors/`** *(Implemented — Phase 2)*:
+  - `models.py`: Pydantic models for `MonitoredRoot` (path validation, immutability), `RawFileNotification` (relative path normalization, timestamp validation, monotonic time attribution), and `WindowsFileAction`.
+  - `base.py`: `BaseWatcher` abstract base class defining lifecycle methods (`start()`, `stop()`, `is_running()`, telemetry flags, and callback registration).
+  - `windows/api.py`: Win32 API declarations via standard library `ctypes` (`CreateFileW`, `ReadDirectoryChangesW`, `CancelIoEx`, `CloseHandle`) and safe fallback guards on non-Windows platforms.
+  - `windows/parser.py`: Low-level binary parser for `FILE_NOTIFY_INFORMATION` structures supporting multibyte UTF-16LE, aligned offsets, Unicode filenames, backslash normalization, and bounds protection.
+  - `windows/watcher.py`: `WindowsDirectoryWatcher` background worker thread with `CancelIoEx` clean shutdown, `ERROR_NOTIFY_ENUM_DIR` buffer overflow detection, and telemetry degradation tracking.
+  - `registry.py`: `MonitoredRootRegistry` managing multi-root monitoring lifecycle (`start_all()`, `stop_all()`), concurrency locks, duplicate path rejection, and telemetry aggregation.
+  - *Architectural Limitation:* Windows filesystem change notifications (`ReadDirectoryChangesW`) report file mutation events but do **not** supply the originating process identifier (PID) or executable image path. Process attribution requires separate telemetry correlation (e.g., via ETW or Sysmon).
 - **`processing/`** *(Planned)*:
   - Event normalization and monotonic sequence ordering.
   - Bounded event queue with backpressure handling.

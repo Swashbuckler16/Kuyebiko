@@ -34,13 +34,24 @@ Kuyebiko operates with complete local data sovereignty: file contents are **neve
 
 ## 3. Current Implementation Status
 
-Kuyebiko is actively under development. Below is the verified status of the codebase at **Phase 1, Step 11**:
+Kuyebiko is actively under development. Below is the verified status of the codebase at **Phase 2 (Steps 2.1, 2.2, and 2.3)**:
 
 ### Implemented Functionality (Tested & Active)
+- **Windows Filesystem Watcher & Collectors Subsystem (`src/kuyebiko/collectors/`):**
+  - `WindowsDirectoryWatcher`: Native Windows directory watcher utilizing `ReadDirectoryChangesW` via standard library `ctypes`. Operates in a dedicated background daemon worker thread with non-blocking graceful cancellation via `CancelIoEx`.
+  - `FILE_NOTIFY_INFORMATION` Binary Parser (`collectors/windows/parser.py`): Low-level byte parser with strict alignment checks, bounds verification, UTF-16LE decoding, and Windows backslash normalization (`\`) to forward slashes (`/`).
+  - `MonitoredRootRegistry`: Thread-safe multi-root registry coordinating independent directory watchers. Enforces directory uniqueness, prevents duplicate registrations or path aliasing, tracks aggregate collector health, and supports unified `start_all()` and `stop_all()` lifecycles.
+  - Collector Models (`collectors/models.py`):
+    - `MonitoredRoot`: Validated directory configuration model enforcing absolute paths, directory existence, immutability (`frozen=True`), and canonical path resolution.
+    - `RawFileNotification`: Raw OS event container enforcing UTC timestamps, monotonic time attribution, relative path normalization, traversal prevention, and conversion to normalized `FileEvent` domain models.
+    - `WindowsFileAction`: IntEnum mapping Win32 action codes (1=ADDED, 2=REMOVED, 3=MODIFIED, 4=RENAMED_OLD_NAME, 5=RENAMED_NEW_NAME) to domain `EventType`.
+  - Telemetry Degradation Handling: Detects OS buffer overflow conditions (`ERROR_NOTIFY_ENUM_DIR`) and marks watcher state as `is_degraded = True` with explicit diagnostic reasoning without crashing the collector.
 - **Domain Data Models (`src/kuyebiko/models/`):**
   - `FileEvent`: Normalized filesystem event schema enforcing UTC timezones, monotonic timestamps, relative path normalization, path traversal prevention (`..`), absolute path rejection, and rename path pairing.
   - `SecurityIncident`: Incident alert model enforcing 0–100 risk score bounds, unique evidence IDs, unique signal family lists, chronological ordering, and categorical severity/confidence ratings.
   - `TelemetrySnapshot`: Operational health model tracking queue capacity, queue depth, dropped event counters, collector states, and validated degradation reasons.
+- **Core Exceptions (`src/kuyebiko/core/exceptions.py`):**
+  - Custom domain hierarchy: `KuyebikoError`, `CollectorError`, `WatcherError`, `RegistryError`, `BufferParseError`, `PathValidationError`.
 - **Application Configuration (`src/kuyebiko/core/config.py`):**
   - `KuyebikoSettings`: Central configuration managed via `pydantic-settings` supporting `.env` files and `KUYEBIKO_` environment variable overrides with validation bounds.
 - **Database Infrastructure (`src/kuyebiko/storage/database.py`):**
@@ -50,15 +61,14 @@ Kuyebiko is actively under development. Below is the verified status of the code
 - **Centralized Diagnostic Logging (`src/kuyebiko/utils/logging_config.py`):**
   - Rotating file logger (`5 MB` max size, `5` backup archives) and stream console logger with clean formatting and shutdown handlers.
 - **Test Suite (`tests/`):**
-  - **53 comprehensive unit tests** (`tests/unit/`) validating data models, edge-case rejection (naive timestamps, traversal, path mismatches), configuration boundaries, database lifecycle, and logging handlers.
-  - **5 foundation integration tests** (`tests/integration/`) verifying cross-component integration across configuration, asynchronous SQLite WAL sessions, Pydantic JSON serialization, and centralized logging.
-  - **58 total passing tests** with **98% overall code coverage**.
+  - **101 comprehensive unit tests** (`tests/unit/`) validating collector models, parser edge cases, native watcher thread lifecycle, multi-root registry coordination, domain schemas, configuration, and logging.
+  - **9 integration tests** (`tests/integration/`) verifying live Windows `ReadDirectoryChangesW` filesystem events (creation, modification, deletion, renames), recursive vs. non-recursive monitoring, watcher stopping semantics, multi-root directory isolation, and async database WAL operations.
+  - **110 total passing tests** with **92% overall code coverage**.
 
 ### Partially Implemented Functionality
-- **Package Architecture:** Modular package structure established under `src/kuyebiko/` with package initializers (`collectors`, `processing`, `detection`, `integrity`, `application`).
+- **Package Architecture:** Modular package structure established under `src/kuyebiko/` with package initializers (`processing`, `detection`, `integrity`, `application`).
 
 ### Planned Functionality (Next Phases)
-- **Windows Filesystem Watcher (`collectors/`):** Native Windows `ReadDirectoryChangesW` asynchronous event capture.
 - **Event Processing Queue (`processing/`):** Bounded ingestion ring buffers, drop counters, and backpressure management.
 - **Behavioural Detection Engine (`detection/`):** Sliding time-window correlation, 10 signal evaluators, and normalized scoring formulas.
 - **Relational Tables & Migrations (`storage/migrations/`):** Relational schema definitions for events and incidents.
@@ -75,7 +85,7 @@ Kuyebiko is actively under development. Below is the verified status of the code
 | **Language & Runtime** | Python 3.12+ (tested on Python 3.14) | Windows C-types / native win32 bindings |
 | **Data Validation** | Pydantic v2.10+, Pydantic Settings v2.7+ | — |
 | **Storage & Persistence**| SQLAlchemy 2.0 (asyncio), aiosqlite 0.20+, SQLite 3 WAL | Alembic migrations, SHA-256 hash chaining |
-| **Telemetry Ingestion** | Internal Pydantic schema validation | Windows `ReadDirectoryChangesW`, Sysmon adapter |
+| **Telemetry Ingestion** | Windows `ReadDirectoryChangesW` (Implemented), Pydantic schemas | Sysmon / ETW adapters |
 | **User Interface** | Rotating diagnostic file logger, console streams | PySide6 (Qt for Python desktop UI) |
 | **Quality & Testing** | pytest 8.0+, pytest-cov 7.1+, Ruff 0.9+ | Labelled synthetic benchmark runner |
 
@@ -101,13 +111,22 @@ Kuyebiko/
 │       │   ├── __init__.py
 │       │   ├── config.py         # KuyebikoSettings (pydantic-settings)
 │       │   ├── constants.py      # Constants (planned)
-│       │   └── exceptions.py     # Domain exceptions (planned)
+│       │   └── exceptions.py     # Domain exceptions (Implemented)
 │       ├── models/               # Domain Pydantic schemas (Implemented)
 │       │   ├── __init__.py
 │       │   ├── events.py         # FileEvent, EventType, EventSource
 │       │   ├── incidents.py      # SecurityIncident, IncidentSeverity
 │       │   └── telemetry.py      # TelemetrySnapshot, MonitoringStatus
-│       ├── collectors/           # Windows watchers and telemetry adapters (Planned)
+│       ├── collectors/           # Filesystem and OS telemetry collectors (Implemented)
+│       │   ├── __init__.py       # Collector package exports
+│       │   ├── base.py           # BaseWatcher abstract class & type aliases
+│       │   ├── models.py         # MonitoredRoot, RawFileNotification, WindowsFileAction
+│       │   ├── registry.py       # MonitoredRootRegistry multi-root coordinator
+│       │   └── windows/          # Native Windows watcher implementation
+│       │       ├── __init__.py
+│       │       ├── api.py        # Win32 ctypes signatures & error constants
+│       │       ├── parser.py     # FILE_NOTIFY_INFORMATION buffer parser
+│       │       └── watcher.py    # WindowsDirectoryWatcher worker thread
 │       ├── processing/           # Normalization and bounded event queue (Planned)
 │       ├── detection/            # Signal evaluators and scoring engine (Planned)
 │       ├── storage/              # Database engine and migrations
@@ -121,15 +140,20 @@ Kuyebiko/
 │           └── logging_config.py # Rotating logger configuration (Implemented)
 ├── tests/
 │   ├── __init__.py
-│   ├── unit/                     # Unit test suite (53 passing tests)
+│   ├── unit/                     # Unit test suite (101 passing tests)
+│   │   ├── test_collector_models.py
 │   │   ├── test_config.py
 │   │   ├── test_database.py
 │   │   ├── test_events.py
 │   │   ├── test_incidents.py
 │   │   ├── test_logging.py
-│   │   └── test_telemetry.py
-│   ├── integration/              # Integration tests (5 passing tests)
-│   │   └── test_foundation_integration.py
+│   │   ├── test_root_registry.py
+│   │   ├── test_telemetry.py
+│   │   ├── test_windows_parser.py
+│   │   └── test_windows_watcher.py
+│   ├── integration/              # Integration tests (9 passing tests)
+│   │   ├── test_foundation_integration.py
+│   │   └── test_windows_watcher_integration.py
 │   └── fixtures/                 # Labelled JSONL test traces (Planned)
 ├── scripts/                      # Utility and benchmark scripts
 ├── .env.example                  # Example environment configuration
@@ -254,18 +278,23 @@ Kuyebiko is engineered as a defensive, privacy-preserving visibility aid, but op
 
 1. **User-Mode Boundary:** A user-mode security application **cannot** guarantee survival against an adversary possessing local administrator or Windows kernel-level (ring 0) privileges.
 2. **Local Hash Chain Boundary:** A local cryptographic hash chain detects row modification or deletion within a sequence, but cannot prevent an attacker with full filesystem permissions from deleting the database or rewriting it with recalculated hashes.
-3. **Notification Buffer Drops:** Windows filesystem change notifications (`ReadDirectoryChangesW`) rely on fixed-size OS kernel buffers. Massive file bursts may overflow these buffers. Kuyebiko reports this as `DEGRADED`, but cannot recreate events dropped by the OS.
-4. **Heuristic Nature:** Behavioural detection is heuristic. It may produce false alarms during intense benign batch operations (compilers, photo converters) and may fail to detect low-frequency, throttled encryption (low-and-slow evasion).
-5. **Not Antivirus or EDR:** Kuyebiko does not quarantine files, block processes, inject into foreign executables, or modify Windows ACLs in MVP. It is designed to complement—not replace—Microsoft Defender.
-6. **Zero Prevention Guarantee:** Kuyebiko provides monitoring and investigation visibility. It does **not** guarantee that file encryption will be prevented, nor does it recover damaged files.
+3. **Notification Buffer Drops:** Windows filesystem change notifications (`ReadDirectoryChangesW`) rely on fixed-size OS kernel buffers. Massive file bursts may overflow these buffers. Kuyebiko reports this as `is_degraded = True` (`ERROR_NOTIFY_ENUM_DIR`), but cannot recreate events dropped by the OS.
+4. **No Process Attribution from ReadDirectoryChangesW:** The native Windows filesystem notification API (`ReadDirectoryChangesW`) delivers filesystem action records (add, remove, modify, rename) but **does not** provide the originating Process Identifier (PID) or process image name. Process attribution requires correlating filesystem events with dedicated process telemetry (e.g., Event Tracing for Windows (ETW) or Sysmon).
+5. **Heuristic Nature:** Behavioural detection is heuristic. It may produce false alarms during intense benign batch operations (compilers, photo converters) and may fail to detect low-frequency, throttled encryption (low-and-slow evasion).
+6. **Not Antivirus or EDR:** Kuyebiko does not quarantine files, block processes, inject into foreign executables, or modify Windows ACLs in MVP. It is designed to complement—not replace—Microsoft Defender.
+7. **Zero Prevention Guarantee:** Kuyebiko provides monitoring and investigation visibility. It does **not** guarantee that file encryption will be prevented, nor does it recover damaged files.
 
 ---
 
 ## 10. Project Roadmap Summary
 
 - **Phase 0 — Foundation:** Repository scaffolding, packaging configuration, and threat model establishment. *(Complete)*
-- **Phase 1 — Core Models & Infrastructure:** Data schemas, Pydantic validation, async SQLite WAL engine, rotating logger, and technical documentation. *(Complete — Current Step)*
-- **Phase 2 — Ingestion & Monitoring MVP:** Windows `ReadDirectoryChangesW` watcher, bounded event queue with backpressure, and source health tracking.
+- **Phase 1 — Core Models & Infrastructure:** Data schemas, Pydantic validation, async SQLite WAL engine, rotating logger, and technical documentation. *(Complete)*
+- **Phase 2 — Ingestion & Monitoring MVP:**
+  - **Phase 2.1 — Watcher Architecture:** Abstract `BaseWatcher`, `MonitoredRoot`, `RawFileNotification`, and normalized event adapters. *(Complete)*
+  - **Phase 2.2 — Native Windows Watcher:** `ReadDirectoryChangesW` watcher, `ctypes` bindings, buffer parser, worker thread, `CancelIoEx` shutdown, and telemetry degradation handling. *(Complete)*
+  - **Phase 2.3 — Monitored Roots Registry:** Multi-root registry, duplicate rejection, thread safety, and lifecycle management. *(Complete)*
+  - **Phase 2.4 — Processing Queue & Normalizer:** Bounded ring buffers, queue overflow handling, and backpressure management. *(Next Step)*
 - **Phase 3 — Behavioural Detection MVP:** Rolling window correlator, 10 signal evaluators, normalized scoring engine, and relational incident persistence.
 - **Phase 4 — Presentation & Integrity:** PySide6 desktop dashboard, incident timeline inspector, cryptographic hash chaining, and sandboxed test simulator.
 - **Phase 5 — Validation & Benchmark:** Labelled synthetic corpus validation, benign workload matrix evaluation, and empirical metric publishing.
