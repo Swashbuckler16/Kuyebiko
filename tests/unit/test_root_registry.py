@@ -455,3 +455,52 @@ def test_registry_startup_cleanup_failure_retains_watcher(tmp_path: Path):
     registry.stop("leak-test")
     assert registry.get_state("leak-test") == RootLifecycleState.STOPPED
     assert registry.get_watcher("leak-test") is None
+
+
+def test_registry_stop_handle_cleanup_failure_transitions_to_error_state(
+    tmp_path: Path,
+):
+    """When stop() raises because handle close fails, state becomes ERROR."""
+
+    class HandleCloseFailWatcher(DummyWatcher):
+        def __init__(self, root, callback):
+            super().__init__(root, callback)
+            self._has_resources = True
+            self._close_fails = True
+
+        def has_active_resources(self) -> bool:
+            return self._has_resources
+
+        def stop(self) -> None:
+            # Worker thread terminated cleanly
+            self._running = False
+            if self._close_fails:
+                # But CloseHandle failed!
+                raise RuntimeError("CloseHandle returned FALSE")
+            self._has_resources = False
+
+    registry = MonitoredRootRegistry(
+        watcher_factory=lambda r, cb: HandleCloseFailWatcher(r, cb)
+    )
+    root = MonitoredRoot(root_id="handle-fail-test", path=tmp_path)
+    registry.register(root)
+    registry.start("handle-fail-test")
+    assert registry.get_state("handle-fail-test") == RootLifecycleState.RUNNING
+
+    watcher = registry.get_watcher("handle-fail-test")
+
+    # stop() raises because CloseHandle failed, while worker is no longer running
+    with pytest.raises(RegistryError, match="CloseHandle returned FALSE"):
+        registry.stop("handle-fail-test")
+
+    # State must be ERROR (not RUNNING, since worker stopped) and watcher retained
+    assert registry.get_state("handle-fail-test") == RootLifecycleState.ERROR
+    assert registry.get_watcher("handle-fail-test") is watcher
+    assert watcher.has_active_resources() is True
+
+    # Retry cleanup with working close
+    watcher._close_fails = False
+    registry.stop("handle-fail-test")
+
+    assert registry.get_state("handle-fail-test") == RootLifecycleState.STOPPED
+    assert registry.get_watcher("handle-fail-test") is None

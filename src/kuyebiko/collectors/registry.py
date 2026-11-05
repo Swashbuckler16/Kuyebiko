@@ -131,7 +131,13 @@ class MonitoredRootRegistry:
             except Exception as err:
                 with self._lock:
                     if root_id in self._roots:
-                        self._states[root_id] = RootLifecycleState.RUNNING
+                        # If worker thread is still running, state is RUNNING.
+                        # If worker stopped but handle cleanup failed, state is ERROR.
+                        self._states[root_id] = (
+                            RootLifecycleState.RUNNING
+                            if watcher_to_stop.is_running()
+                            else RootLifecycleState.ERROR
+                        )
                 logger.error(
                     "Error stopping watcher for '%s' during unregister: %s",
                     root_id,
@@ -255,7 +261,13 @@ class MonitoredRootRegistry:
             except Exception as err:
                 with self._lock:
                     if root_id in self._roots:
-                        self._states[root_id] = RootLifecycleState.RUNNING
+                        # If worker thread is still running, state is RUNNING.
+                        # If worker stopped but handle cleanup failed, state is ERROR.
+                        self._states[root_id] = (
+                            RootLifecycleState.RUNNING
+                            if watcher_to_stop.is_running()
+                            else RootLifecycleState.ERROR
+                        )
                 logger.error(
                     "Error stopping watcher for root '%s': %s",
                     root_id,
@@ -332,7 +344,11 @@ class MonitoredRootRegistry:
                 )
                 with self._lock:
                     if root_id in self._roots:
-                        self._states[root_id] = RootLifecycleState.RUNNING
+                        self._states[root_id] = (
+                            RootLifecycleState.RUNNING
+                            if watcher.is_running()
+                            else RootLifecycleState.ERROR
+                        )
             else:
                 with self._lock:
                     if watcher.has_active_resources():

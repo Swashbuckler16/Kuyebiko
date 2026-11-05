@@ -3,7 +3,7 @@
 > **Status:** COMPLETE  
 > **Repository:** [https://github.com/Swashbuckler16/Kuyebiko.git](https://github.com/Swashbuckler16/Kuyebiko.git)  
 > **Branch:** `main`  
-> **Latest Remote Baseline Commit:** `3ac2881`  
+> **Latest Remote Baseline Commit:** `064e82a`  
 > **Scope:** Phase 2.1 through Phase 2.9 (Windows Filesystem Monitoring & Verification)
 
 ---
@@ -97,7 +97,9 @@ The collector detects and normalizes the following filesystem operations across 
   - If `CloseHandle` returns `False`, `self._handle` is **retained**, operational health transitions to `WatcherHealth.ERROR`, and subsequent cleanup retries remain possible.
   - The watcher handle is never closed while worker threads remain alive.
 - In `start()`, if `thread.start()` fails after `CreateFileW` succeeded, transactional cleanup immediately closes the directory handle. If handle cleanup also fails, the watcher enters `ERROR` and retains references.
-- In `registry.py`, if a watcher startup or shutdown leaves allocated resources, the registry retains the watcher in `RootLifecycleState.ERROR` to prevent duplicate watchers or native resource leaks.
+- In `registry.py`, lifecycle exception management differentiates between thread termination failures and handle cleanup failures:
+  - If worker thread fails to terminate within the timeout, the root state remains `RootLifecycleState.RUNNING` with the watcher retained.
+  - If the worker thread terminates cleanly but handle closure fails, the root transitions to `RootLifecycleState.ERROR` while retaining the watcher reference to prevent duplicate registrations and permit cleanup retries.
 
 ### 5.2 Thread Concurrency & Idempotency
 - `WindowsDirectoryWatcher.stop()` utilizes an internal stop lock (`_stop_lock`) preventing race conditions during concurrent stop calls.
@@ -122,7 +124,7 @@ platform win32 -- Python 3.14.4, pytest-9.2.0, pluggy-1.7.0
 rootdir: C:\Users\ASUS\OneDrive\文档\Kuyebiko
 configfile: pyproject.toml
 testpaths: tests
-collected 157 items
+collected 158 items
 
 tests/integration/test_foundation_integration.py (5 tests)               PASSED
 tests/integration/test_windows_watcher_integration.py (8 tests)          PASSED
@@ -134,14 +136,14 @@ tests/unit/test_incidents.py (13 tests)                                  PASSED
 tests/unit/test_logging.py (5 tests)                                     PASSED
 tests/unit/test_normalizer.py (8 tests)                                  PASSED
 tests/unit/test_rename_correlator.py (10 tests)                          PASSED
-tests/unit/test_root_registry.py (18 tests)                              PASSED
+tests/unit/test_root_registry.py (19 tests)                              PASSED
 tests/unit/test_telemetry.py (13 tests)                                  PASSED
 tests/unit/test_windows_parser.py (10 tests)                             PASSED
 tests/unit/test_windows_watcher.py (20 tests)                            PASSED
 
 ----------------------------------------------------------------------------
-TOTAL: 1183 statements, 104 missed, 91% code coverage
-============================= 157 passed in 4.89s =============================
+TOTAL: 1188 statements, 104 missed, 91% code coverage
+============================= 158 passed in 4.95s =============================
 ```
 
 ### Static Analysis
@@ -187,7 +189,7 @@ The Phase 2 monitoring subsystem is verified and ready for Phase 3 (Event Ingest
    - Guaranteed immutable Pydantic models.
    - Monotonically increasing atomic `sequence_number`.
    - Guaranteed UTC `timestamp` and nanosecond `monotonic_ns`.
-   - Relative normalized path (forward slashes `/`, traversal tokens `..` stripped).
+   - Relative normalized path (forward slashes `/`; traversal tokens `..`, absolute paths, and drive prefixes strictly rejected via validation errors).
    - Validated rename pairs with both `old_path` and `new_path`.
    - Root attribution via `root_id`.
 2. **Telemetry & Degradation Telemetry:**

@@ -34,19 +34,19 @@ Kuyebiko operates with complete local data sovereignty: file contents are **neve
 
 ## 3. Current Implementation Status
 
-Kuyebiko is actively under development. Below is the verified status of the codebase at **Phase 2 Complete (Steps 2.1 through 2.8)**:
+Kuyebiko is actively under development. Below is the verified status of the codebase at **Phase 2 Complete (Steps 2.1 through 2.9)**:
 
 ### Implemented Functionality (Tested & Active)
 - **Windows Filesystem Watcher & Collectors Subsystem (`src/kuyebiko/collectors/`):**
   - `WindowsDirectoryWatcher`: Native Windows directory watcher utilizing `ReadDirectoryChangesW` via standard library `ctypes`. Operates in a dedicated background worker thread with non-blocking graceful cancellation via `CancelIoEx`.
   - Transactional Lifecycle Hardening: Guaranteed handle closing on thread start failures; clean timeout shutdowns without dangling handle leaks; strict resource ownership semantics.
   - `FILE_NOTIFY_INFORMATION` Binary Parser (`collectors/windows/parser.py`): Low-level byte parser with strict alignment checks, bounds verification, UTF-16LE decoding, Unicode filename handling, and Windows path normalization.
-  - `RenameCorrelator` (`collectors/rename_correlator.py`): Thread-safe rename correlation engine pairing `RENAMED_OLD_NAME` and `RENAMED_NEW_NAME` events within a bounded time window (1.0s default). Enforces per-root isolation, bounded pending queues with capacity eviction, rejection of self-renames, and un-correlated rename safety.
+  - `RenameCorrelator` (`collectors/rename_correlator.py`): Thread-safe rename correlation engine pairing `RENAMED_OLD_NAME` and `RENAMED_NEW_NAME` events based on temporal proximity and directory alignment within a bounded time window (1.0s default). Enforces per-root isolation, bounded pending queues with capacity eviction, rejection of self-renames, and un-correlated rename safety.
   - `EventNormalizer` (`collectors/normalizer.py` & `src/kuyebiko/processing/`): Deterministic event normalizer transforming Win32 raw notifications into domain `FileEvent` objects. Generates collision-resistant UUIDs, atomic monotonic sequence numbers, dual timestamps (UTC + monotonic), path validation, directory flag preservation, and telemetry quality mapping.
   - Telemetry Degradation & Buffer Overflow Management (`collectors/base.py` & `collectors/windows/watcher.py`):
     - `WatcherHealth` state machine: `HEALTHY`, `DEGRADED`, `STOPPED`, and `ERROR`.
-    - Detects OS buffer overflow conditions (`ERROR_NOTIFY_ENUM_DIR` / WinError 234) and zero-byte reads, tracks cumulative `overflow_count` and estimated `gap_count`, records deduplicated degradation reasons, and automatically recovers health state on subsequent successful reads.
-    - Generates structured `TelemetrySnapshot` metrics capturing event counts, dropped events, queue capacities, and degradation reasons.
+    - Detects OS buffer overflow conditions (`ERROR_NOTIFY_ENUM_DIR` (1022)) and zero-byte reads, tracks cumulative `overflow_count` and estimated `gap_count`, records deduplicated degradation reasons, and automatically recovers health state on subsequent successful reads.
+    - Generates structured `TelemetrySnapshot` metrics capturing event counts, uncounted event loss flags, queue capacities, and degradation reasons.
   - `MonitoredRootRegistry`: Thread-safe multi-root registry coordinating independent directory watchers. Enforces directory uniqueness, prevents duplicate registrations or path aliasing, tracks aggregate collector health, and supports unified `start_all()` and `stop_all()` lifecycles with transactional rollback.
   - Collector Models (`collectors/models.py`):
     - `MonitoredRoot`: Validated directory configuration model enforcing absolute paths, directory existence, immutability (`frozen=True`), and canonical path resolution.
@@ -67,14 +67,14 @@ Kuyebiko is actively under development. Below is the verified status of the code
 - **Centralized Diagnostic Logging (`src/kuyebiko/utils/logging_config.py`):**
   - Rotating file logger (`5 MB` max size, `5` backup archives) and stream console logger with clean formatting and shutdown handlers.
 - **Automated Test Suite (`tests/`):**
-  - **144 comprehensive unit tests** (`tests/unit/`) validating collector models, parser edge cases, native watcher thread lifecycle, rename correlator, normalizer, multi-root registry coordination, domain schemas, configuration, and logging.
+  - **145 comprehensive unit tests** (`tests/unit/`) validating collector models, parser edge cases, native watcher thread lifecycle, rename correlator, normalizer, multi-root registry coordination, domain schemas, configuration, and logging.
   - **13 integration tests** (`tests/integration/`) verifying live Windows `ReadDirectoryChangesW` filesystem events (file/directory CRUD, recursive vs. non-recursive, burst file mutations, shutdown during active concurrent I/O, multi-root directory isolation, end-to-end normalization pipeline, and async database WAL operations).
-  - **157 total passing tests** with **91% overall code coverage**.
+  - **158 total passing tests** with **91% overall code coverage**.
 
 > [!IMPORTANT]
 > **Windows Monitoring Architecture & Limitations:**
 > - **Telemetry Only:** Phase 2 provides an audit-hardened filesystem telemetry ingestion foundation. It does *not* execute ransomware detection, scoring rules, or automated remediation; detection correlation is scheduled for Phase 3.
-> - **Notification-Based Semantics:** Windows `ReadDirectoryChangesW` is a notification mechanism, not a guaranteed lossless audit log. Under extreme I/O burst pressure, OS buffers can overflow (`ERROR_NOTIFY_ENUM_DIR`). Kuyebiko captures this uncertainty through explicit `WatcherHealth.DEGRADED` states, `uncounted_event_loss` flags, and `gap_count` metrics.
+> - **Notification-Based Semantics:** Windows `ReadDirectoryChangesW` is a notification mechanism, not a guaranteed lossless audit log. Under extreme I/O burst pressure, OS buffers can overflow (`ERROR_NOTIFY_ENUM_DIR` (1022)). Kuyebiko captures this uncertainty through explicit `WatcherHealth.DEGRADED` states, `uncounted_event_loss` flags, and `gap_count` metrics.
 > - **No Process Attribution:** Win32 filesystem notifications identify file path mutations but do *not* report the originating process identifier (PID) or executable image path. Process attribution will be introduced in subsequent phases via ETW/Sysmon adapters.
 
 ### Partially Implemented Functionality
