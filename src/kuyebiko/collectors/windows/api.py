@@ -192,3 +192,4 @@ def get_last_error() -> int:
     if not is_windows_platform() or _GetLastError is None:
         return 0
     return int(_GetLastError())
+

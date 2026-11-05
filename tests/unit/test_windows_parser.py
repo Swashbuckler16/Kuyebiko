@@ -157,3 +157,4 @@ def test_parse_rejects_malformed_utf16_surrogate():
     header = struct.pack("<III", 0, 1, len(malformed_utf16)) + malformed_utf16
     with pytest.raises(BufferParseError, match="Failed to decode UTF-16LE"):
         parse_file_notify_information(header, len(header))
+

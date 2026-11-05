@@ -44,3 +44,4 @@ class BaseWatcher(ABC):
     @abstractmethod
     def degradation_reason(self) -> str | None:
         """Return diagnostic explanation if the watcher is in a degraded state."""
+
