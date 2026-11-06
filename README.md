@@ -34,9 +34,14 @@ Kuyebiko operates with complete local data sovereignty: file contents are **neve
 
 ## 3. Current Implementation Status
 
-Kuyebiko is actively under development. Below is the verified status of the codebase at **Phase 2 Complete (Steps 2.1 through 2.9)**:
+Kuyebiko is actively under development. Below is the verified status of the codebase at **Phase 3 Active (Steps 3.1 through 3.4 Complete)**:
 
 ### Implemented Functionality (Tested & Active)
+- **Event Processing & Ingestion Subsystem (`src/kuyebiko/processing/`):**
+  - `EventIngestor` (`processing/ingestion.py`): Fast, thread-safe ingestion interface connecting filesystem watchers and multi-root registries to the processing pipeline. Validates input types, tracks per-root counts, and emits type-safe `IngestionOutcome` status (`ACCEPTED`, `QUEUE_FULL`, `REJECTED`, `SHUTTING_DOWN`).
+  - `BoundedEventQueue` (`processing/queue.py`): Thread-safe bounded buffer wrapping standard library `queue.Queue` with configurable capacity (`KUYEBIKO_EVENT_QUEUE_SIZE`), non-blocking submission semantics, high-watermark tracking, and telemetry degradation on saturation with automatic recovery.
+  - `EventProcessingWorker` (`processing/worker.py`): Dedicated background worker thread executing strictly sequenced event normalization, rename correlation, error isolation, and downstream event dispatch with graceful shutdown draining.
+  - Downstream Consumer Protocol (`processing/contracts.py`): Extensible `@runtime_checkable` `EventConsumer` protocol with reference `CallbackEventConsumer` and thread-safe `InMemoryEventConsumer` implementations.
 - **Windows Filesystem Watcher & Collectors Subsystem (`src/kuyebiko/collectors/`):**
   - `WindowsDirectoryWatcher`: Native Windows directory watcher utilizing `ReadDirectoryChangesW` via standard library `ctypes`. Operates in a dedicated background worker thread with non-blocking graceful cancellation via `CancelIoEx`.
   - Transactional Lifecycle Hardening: Guaranteed handle closing on thread start failures; clean timeout shutdowns without dangling handle leaks; strict resource ownership semantics.
@@ -57,7 +62,7 @@ Kuyebiko is actively under development. Below is the verified status of the code
   - `SecurityIncident`: Incident alert model enforcing 0–100 risk score bounds, unique evidence IDs, unique signal family lists, chronological ordering, and categorical severity/confidence ratings.
   - `TelemetrySnapshot`: Operational health model tracking queue capacity, queue depth, dropped event counters, collector states, and validated degradation reasons.
 - **Core Exceptions (`src/kuyebiko/core/exceptions.py`):**
-  - Custom domain hierarchy: `KuyebikoError`, `CollectorError`, `WatcherError`, `RegistryError`, `BufferParseError`, `PathValidationError`, `NormalizationError`.
+  - Custom domain hierarchy: `KuyebikoError`, `CollectorError`, `WatcherError`, `RegistryError`, `BufferParseError`, `PathValidationError`, `NormalizationError`, `ProcessingError`, `QueueFullError`, `WorkerLifecycleError`.
 - **Application Configuration (`src/kuyebiko/core/config.py`):**
   - `KuyebikoSettings`: Central configuration managed via `pydantic-settings` supporting `.env` files and `KUYEBIKO_` environment variable overrides with validation bounds.
 - **Database Infrastructure (`src/kuyebiko/storage/database.py`):**
@@ -67,13 +72,13 @@ Kuyebiko is actively under development. Below is the verified status of the code
 - **Centralized Diagnostic Logging (`src/kuyebiko/utils/logging_config.py`):**
   - Rotating file logger (`5 MB` max size, `5` backup archives) and stream console logger with clean formatting and shutdown handlers.
 - **Automated Test Suite (`tests/`):**
-  - **145 comprehensive unit tests** (`tests/unit/`) validating collector models, parser edge cases, native watcher thread lifecycle, rename correlator, normalizer, multi-root registry coordination, domain schemas, configuration, and logging.
-  - **13 integration tests** (`tests/integration/`) verifying live Windows `ReadDirectoryChangesW` filesystem events (file/directory CRUD, recursive vs. non-recursive, burst file mutations, shutdown during active concurrent I/O, multi-root directory isolation, end-to-end normalization pipeline, and async database WAL operations).
-  - **158 total passing tests** with **91% overall code coverage**.
+  - **183 comprehensive unit tests** (`tests/unit/`) validating event processing contracts, bounded queues, ingestion backpressure, worker thread lifecycles, collectors, parsers, normalizers, and domain schemas.
+  - **15 integration tests** (`tests/integration/`) verifying live Windows `ReadDirectoryChangesW` filesystem events, end-to-end watcher-to-worker pipeline dispatch, multi-root registry routing, and async database WAL operations.
+  - **198 total passing tests** with **93% overall code coverage**.
 
 > [!IMPORTANT]
 > **Windows Monitoring Architecture & Limitations:**
-> - **Telemetry Only:** Phase 2 provides an audit-hardened filesystem telemetry ingestion foundation. It does *not* execute ransomware detection, scoring rules, or automated remediation; detection correlation is scheduled for Phase 3.
+> - **Telemetry Only:** Phase 2 and Phase 3 provide an audit-hardened filesystem telemetry ingestion and processing foundation. They do *not* execute ransomware detection, scoring rules, or automated remediation; detection correlation is scheduled for Phase 4.
 > - **Notification-Based Semantics:** Windows `ReadDirectoryChangesW` is a notification mechanism, not a guaranteed lossless audit log. Under extreme I/O burst pressure, OS buffers can overflow (`ERROR_NOTIFY_ENUM_DIR` (1022)). Kuyebiko captures this uncertainty through explicit `WatcherHealth.DEGRADED` states, `uncounted_event_loss` flags, and `gap_count` metrics.
 > - **No Process Attribution:** Win32 filesystem notifications identify file path mutations but do *not* report the originating process identifier (PID) or executable image path. Process attribution will be introduced in subsequent phases via ETW/Sysmon adapters.
 
@@ -81,8 +86,7 @@ Kuyebiko is actively under development. Below is the verified status of the code
 - **Package Architecture:** Modular package structure established under `src/kuyebiko/` with package initializers (`processing`, `detection`, `integrity`, `application`).
 
 ### Planned Functionality (Next Phases)
-- **Event Processing Queue (`processing/`):** Bounded ingestion ring buffers, drop counters, and backpressure management.
-- **Behavioural Detection Engine (`detection/`):** Sliding time-window correlation, 10 signal evaluators, and normalized scoring formulas.
+- **Behavioural Detection Engine (`detection/`):** Sliding time-window correlation, 10 signal evaluators, and normalized scoring formulas (Phase 4).
 - **Relational Tables & Migrations (`storage/migrations/`):** Relational schema definitions for events and incidents.
 - **Tamper Evidence & Integrity (`integrity/`):** SHA-256 cryptographic hash chaining over incident records.
 - **Desktop Interface (`application/`):** PySide6 graphical dashboard, folder manager, and incident timeline inspector.
@@ -139,8 +143,13 @@ Kuyebiko/
 │       │       ├── api.py        # Win32 ctypes signatures & error constants
 │       │       ├── parser.py     # FILE_NOTIFY_INFORMATION buffer parser
 │       │       └── watcher.py    # WindowsDirectoryWatcher worker thread
-│       ├── processing/           # Normalization and bounded event queue (Planned)
-│       ├── detection/            # Signal evaluators and scoring engine (Planned)
+│       ├── processing/           # Normalization, bounded queue, worker (Implemented)
+│       │   ├── __init__.py       # Processing exports
+│       │   ├── contracts.py      # EventConsumer protocol, outcomes, reference consumers
+│       │   ├── ingestion.py      # EventIngestor pipeline interface
+│       │   ├── queue.py          # BoundedEventQueue and EventQueueMetrics
+│       │   └── worker.py         # EventProcessingWorker thread
+│       ├── detection/            # Signal evaluators and scoring engine (Phase 4)
 │       ├── storage/              # Database engine and migrations
 │       │   ├── __init__.py
 │       │   ├── database.py       # Asynchronous SQLite Database class (Implemented)

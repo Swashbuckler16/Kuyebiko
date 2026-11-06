@@ -27,3 +27,15 @@ class PathValidationError(CollectorError):
 
 class NormalizationError(CollectorError, ValueError):
     """Raised when a raw notification cannot be normalized into a valid FileEvent."""
+
+
+class ProcessingError(KuyebikoError):
+    """Base exception for event processing pipeline errors."""
+
+
+class QueueFullError(ProcessingError):
+    """Raised when a bounded event queue cannot accept further notifications."""
+
+
+class WorkerLifecycleError(ProcessingError):
+    """Raised when an invalid worker lifecycle state transition is attempted."""
