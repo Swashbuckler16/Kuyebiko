@@ -384,6 +384,11 @@ class MonitoredRootRegistry:
         with self._lock:
             return list(self._roots.values())
 
+    def list_watchers(self) -> list[BaseWatcher]:
+        """Return a copy of all current watchers (active or holding resources)."""
+        with self._lock:
+            return list(self._watchers.values())
+
     def list_active_watchers(self) -> list[str]:
         """Return list of root IDs that currently have running watchers."""
         with self._lock:

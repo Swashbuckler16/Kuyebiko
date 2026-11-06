@@ -34,17 +34,18 @@ Kuyebiko operates with complete local data sovereignty: file contents are **neve
 
 ## 3. Current Implementation Status
 
-Kuyebiko is actively under development. Below is the verified status of the codebase at **Phase 3 Active (Steps 3.1 through 3.9 Complete)**:
+Kuyebiko is actively under development. Below is the verified status of the codebase at **Phase 3 Complete (Steps 3.1 through 3.14 Verified)**:
 
 ### Implemented Functionality (Tested & Active)
 - **Event Processing & Ingestion Subsystem (`src/kuyebiko/processing/`):**
+  - `EventPipeline` (`processing/pipeline.py`): Central lifecycle coordinator managing deterministic startup, graceful draining, safe shutdown, and leak-free restart across `MonitoredRootRegistry`, `BoundedEventQueue`, `EventIngestor`, and `EventProcessingWorker`. Implements automatic rollback on partial startup failure and strict `PipelineLifecycleState` transitions (`STOPPED`, `STARTING`, `RUNNING`, `STOPPING`, `ERROR`).
   - `EventIngestor` (`processing/ingestion.py`): Fast, thread-safe ingestion interface connecting filesystem watchers and multi-root registries to the processing pipeline. Validates input types, tracks per-root counts, and emits type-safe `IngestionOutcome` status (`ACCEPTED`, `QUEUE_FULL`, `REJECTED`, `SHUTTING_DOWN`).
   - `BoundedEventQueue` (`processing/queue.py`): Thread-safe bounded buffer wrapping standard library `queue.Queue` with configurable capacity (`KUYEBIKO_EVENT_QUEUE_SIZE`), non-blocking submission semantics, high-watermark tracking, and telemetry degradation on saturation with automatic recovery.
-  - `EventProcessingWorker` (`processing/worker.py`): Dedicated background worker thread executing strictly sequenced event normalization, rename correlation, error isolation, bounded retries, and downstream event dispatch with graceful shutdown draining.
-  - `EventDeduplicator` (`processing/deduplication.py`): Conservative duplicate event filter with bounded fingerprint cache. Suppresses only exact duplicate notification deliveries while strictly preserving legitimate sequential writes, multi-chunk modifications, and create-modify sequences.
+  - `EventProcessingWorker` (`processing/worker.py`): Dedicated background worker thread executing strictly sequenced event normalization, rename correlation, error isolation, bounded retries (at-least-once delivery semantics), and downstream event dispatch with graceful shutdown draining.
+  - `EventDeduplicator` (`processing/deduplication.py`): Conservative duplicate event filter with bounded fingerprint cache and TTL-based expiration (`ttl_seconds=5.0`). Suppresses only exact duplicate notification deliveries while strictly preserving legitimate sequential writes, multi-chunk modifications, and create-modify sequences.
   - `EventOrderingTracker` (`processing/ordering.py`): Chronology and latency tracking per monitored root. Detects out-of-order event arrivals and monitors processing latency without corrupting observation timestamps or stalling the pipeline.
-  - `PipelineTelemetryAggregator` (`processing/telemetry.py`): Structured telemetry aggregator providing separate accounting for Windows kernel buffer overflows (`ERROR_NOTIFY_ENUM_DIR`) vs. application queue backpressure drops (`QUEUE_FULL`).
-  - Downstream Consumer Protocol (`processing/contracts.py`): Extensible `@runtime_checkable` `EventConsumer` protocol with reference `CallbackEventConsumer` and thread-safe `InMemoryEventConsumer` implementations.
+  - `PipelineTelemetryAggregator` (`processing/telemetry.py`): Structured telemetry aggregator providing separate accounting for Windows kernel buffer overflows (`ERROR_NOTIFY_ENUM_DIR` (1022)) vs. exact application queue backpressure drops (`QUEUE_FULL`), tracking `PipelineHealth` (`HEALTHY`, `DEGRADED`, `ERROR`, `STOPPED`).
+  - Downstream Consumer Protocol (`processing/contracts.py`): Extensible `@runtime_checkable` `EventConsumer` protocol with `EventEnvelope` ordering metadata propagation, reference `CallbackEventConsumer`, and thread-safe `InMemoryEventConsumer` implementations.
 - **Windows Filesystem Watcher & Collectors Subsystem (`src/kuyebiko/collectors/`):**
   - `WindowsDirectoryWatcher`: Native Windows directory watcher utilizing `ReadDirectoryChangesW` via standard library `ctypes`. Operates in a dedicated background worker thread with non-blocking graceful cancellation via `CancelIoEx`.
   - Transactional Lifecycle Hardening: Guaranteed handle closing on thread start failures; clean timeout shutdowns without dangling handle leaks; strict resource ownership semantics.
@@ -65,7 +66,7 @@ Kuyebiko is actively under development. Below is the verified status of the code
   - `SecurityIncident`: Incident alert model enforcing 0–100 risk score bounds, unique evidence IDs, unique signal family lists, chronological ordering, and categorical severity/confidence ratings.
   - `TelemetrySnapshot`: Operational health model tracking queue capacity, queue depth, dropped event counters, collector states, and validated degradation reasons.
 - **Core Exceptions (`src/kuyebiko/core/exceptions.py`):**
-  - Custom domain hierarchy: `KuyebikoError`, `CollectorError`, `WatcherError`, `RegistryError`, `BufferParseError`, `PathValidationError`, `NormalizationError`, `ProcessingError`, `QueueFullError`, `WorkerLifecycleError`.
+  - Custom domain hierarchy: `KuyebikoError`, `CollectorError`, `WatcherError`, `RegistryError`, `BufferParseError`, `PathValidationError`, `NormalizationError`, `ProcessingError`, `QueueFullError`, `WorkerLifecycleError`, `PipelineLifecycleError`.
 - **Application Configuration (`src/kuyebiko/core/config.py`):**
   - `KuyebikoSettings`: Central configuration managed via `pydantic-settings` supporting `.env` files and `KUYEBIKO_` environment variable overrides with validation bounds.
 - **Database Infrastructure (`src/kuyebiko/storage/database.py`):**
@@ -75,9 +76,9 @@ Kuyebiko is actively under development. Below is the verified status of the code
 - **Centralized Diagnostic Logging (`src/kuyebiko/utils/logging_config.py`):**
   - Rotating file logger (`5 MB` max size, `5` backup archives) and stream console logger with clean formatting and shutdown handlers.
 - **Automated Test Suite (`tests/`):**
-  - **221 comprehensive unit tests** (`tests/unit/`) validating event processing contracts, bounded queues, ingestion backpressure, conservative deduplication, ordering tracking, worker thread lifecycles, error isolation, collectors, parsers, normalizers, and domain schemas.
-  - **15 integration tests** (`tests/integration/`) verifying live Windows `ReadDirectoryChangesW` filesystem events, end-to-end watcher-to-worker pipeline dispatch, multi-root registry routing, and async database WAL operations.
-  - **236 total passing tests** with **94% overall code coverage**.
+  - **240 comprehensive unit tests** (`tests/unit/`) validating pipeline lifecycle coordination, bounded queue backpressure, conservative deduplication, ordering tracking, worker thread lifecycles, error isolation, collectors, parsers, normalizers, and domain schemas.
+  - **16 integration tests** (`tests/integration/`) verifying live Windows `ReadDirectoryChangesW` filesystem events, end-to-end watcher-to-worker pipeline dispatch, multi-root registry routing, and async database WAL operations.
+  - **256 total passing tests** with **94% overall code coverage**.
 
 > [!IMPORTANT]
 > **Windows Monitoring Architecture & Limitations:**
@@ -297,6 +298,27 @@ Kuyebiko enforces automated testing on every push and pull request via [`.github
   7. Publishes `coverage.xml` as a build artifact for forensic audit.
 - **Fail-Safe Integrity:** The workflow does not use `continue-on-error: true`; any lint, format, or test failure blocks the PR.
 
+### 8.4 Phase 3 Empirical Performance Baselines
+
+Performance benchmarking was conducted on a reference 64-bit Windows 11 host (AMD64, CPython 3.14.4) using `scripts/measure_phase3_performance.py`:
+
+| Benchmark Scenario | Metric | Measured Result |
+| :--- | :--- | :--- |
+| **Scenario 1: Normal Activity** | Single-Worker Throughput | **16,018 – 17,512 events/sec** |
+| | Average Pipeline Latency | **33.6 – 41.8 ms** |
+| | P50 / P95 / P99 Latency | **32.2 ms / 52.4 ms / 54.8 ms** |
+| | CPU Utilization | ~0.10s CPU time per 2,000 events |
+| **Scenario 2: High-Volume Burst** | Burst Volume into Cap 1,000 | 5,000 notifications submitted |
+| | Backpressure Handling | 100% accounted (accepted + exact drops) |
+| | Burst Drain & Recovery Time | **203 – 291 ms** to zero queue depth |
+| **Scenario 3: Multi-Root Activity**| 4 Concurrent Watcher Threads | **16,365 – 16,775 events/sec** aggregate |
+| | Out-of-Order Observations | **0 retrograde events** detected |
+| **Scenario 4: Conservative Dedup** | Duplicate Write Stream (40% dup) | 1,000 duplicate events suppressed |
+| | Pipeline Speedup | **~11 – 19% faster** (bypasses normalizer/consumer) |
+| **Scenario 5: Fault & Recovery**  | Simulated Consumer Failures | 100% delivered after bounded retry |
+| | Pipeline Worker Restart Latency | **0.50 ms** |
+| **Memory Footprint** | Heap Allocation (tracemalloc) | **1.16 MB baseline / 3.76 MB peak** |
+
 ---
 
 ## 9. Security Scope & Explicit Limitations
@@ -305,7 +327,7 @@ Kuyebiko is engineered as a defensive, privacy-preserving visibility aid, but op
 
 1. **User-Mode Boundary:** A user-mode security application **cannot** guarantee survival against an adversary possessing local administrator or Windows kernel-level (ring 0) privileges.
 2. **Local Hash Chain Boundary:** A local cryptographic hash chain detects row modification or deletion within a sequence, but cannot prevent an attacker with full filesystem permissions from deleting the database or rewriting it with recalculated hashes.
-3. **Notification Buffer Drops:** Windows filesystem change notifications (`ReadDirectoryChangesW`) rely on fixed-size OS kernel buffers. Massive file bursts may overflow these buffers. Kuyebiko reports this as `is_degraded = True` (`ERROR_NOTIFY_ENUM_DIR`), but cannot recreate events dropped by the OS.
+3. **Notification Buffer Drops:** Windows filesystem change notifications (`ReadDirectoryChangesW`) rely on fixed-size OS kernel buffers. Massive file bursts may overflow these buffers. Kuyebiko reports this as `is_degraded = True` (`ERROR_NOTIFY_ENUM_DIR` (1022)), but cannot recreate events dropped by the OS.
 4. **No Process Attribution from ReadDirectoryChangesW:** The native Windows filesystem notification API (`ReadDirectoryChangesW`) delivers filesystem action records (add, remove, modify, rename) but **does not** provide the originating Process Identifier (PID) or process image name. Process attribution requires correlating filesystem events with dedicated process telemetry (e.g., Event Tracing for Windows (ETW) or Sysmon).
 5. **Heuristic Nature:** Behavioural detection is heuristic. It may produce false alarms during intense benign batch operations (compilers, photo converters) and may fail to detect low-frequency, throttled encryption (low-and-slow evasion).
 6. **Not Antivirus or EDR:** Kuyebiko does not quarantine files, block processes, inject into foreign executables, or modify Windows ACLs in MVP. It is designed to complement—not replace—Microsoft Defender.
@@ -317,18 +339,27 @@ Kuyebiko is engineered as a defensive, privacy-preserving visibility aid, but op
 
 - **Phase 0 — Foundation:** Repository scaffolding, packaging configuration, and threat model establishment. *(Complete)*
 - **Phase 1 — Core Models & Infrastructure:** Data schemas, Pydantic validation, async SQLite WAL engine, rotating logger, and technical documentation. *(Complete)*
-- **Phase 2 — Ingestion & Monitoring MVP:**
+- **Phase 2 — Windows Filesystem Monitoring MVP:**
   - **Phase 2.1 — Watcher Architecture:** Abstract `BaseWatcher`, `MonitoredRoot`, `RawFileNotification`, and normalized event adapters. *(Complete)*
   - **Phase 2.2 — Native Windows Watcher:** `ReadDirectoryChangesW` watcher, `ctypes` bindings, buffer parser, worker thread, `CancelIoEx` shutdown, and telemetry degradation handling. *(Complete)*
   - **Phase 2.3 — Monitored Roots Registry:** Multi-root registry, duplicate rejection, thread safety, and lifecycle management. *(Complete)*
-  - **Phase 2.4 — Processing Queue & Normalizer:** Bounded ring buffers, queue overflow handling, and backpressure management. *(Next Step)*
-- **Phase 3 — Behavioural Detection MVP:** Rolling window correlator, 10 signal evaluators, normalized scoring engine, and relational incident persistence.
-- **Phase 4 — Presentation & Integrity:** PySide6 desktop dashboard, incident timeline inspector, cryptographic hash chaining, and sandboxed test simulator.
-- **Phase 5 — Validation & Benchmark:** Labelled synthetic corpus validation, benign workload matrix evaluation, and empirical metric publishing.
-- **Phase 6 — Public Release:** Installer packaging, user guide, demonstration assets, and open-source release.
+  - **Phase 2.4 — Hardened Collectors & Parsers:** Buffer boundary validation, overflow metrics, and regression testing. *(Complete)*
+- **Phase 3 — Event Processing & Normalization:**
+  - Bounded queue backpressure, non-blocking ingestion, single worker thread, conservative deduplication (with TTL), ordering tracking, unified telemetry snapshot, and lifecycle management (`EventPipeline`). *(Complete)*
+- **Phase 4 — Behavioural Detection MVP:** Sliding time-window correlation, 10 signal evaluators, normalized scoring formulas, and relational incident persistence. *(Next Step)*
+- **Phase 5 — Presentation & Integrity:** PySide6 desktop dashboard, incident timeline inspector, cryptographic hash chaining, and sandboxed test simulator.
+- **Phase 6 — Validation & Benchmark:** Labelled synthetic corpus validation, benign workload matrix evaluation, and empirical metric publishing.
+- **Phase 7 — Public Release:** Installer packaging, user guide, demonstration assets, and open-source release.
 
 ---
 
-## 11. Disclaimer & Safety Notice
+## 11. Author, Code Owner & License
+
+- **Code Owner & Primary Contributor:** **Atharva Ghag** ([@Swashbuckler16](https://github.com/Swashbuckler16)) <`atharva.vinod.ghag@gmail.com`>
+- **License:** Distributed under the **GNU General Public License v3.0 (GNU GPL v3.0)**. See the [`LICENSE`](LICENSE) and [`AUTHORS.md`](AUTHORS.md) files for complete terms and attribution details.
+
+---
+
+## 12. Disclaimer & Safety Notice
 
 > **Disclaimer:** Kuyebiko is an experimental, defensive behavioural monitoring tool. It is **not** antivirus software, does **not** guarantee prevention of ransomware infections, and **cannot** decrypt or restore files once modified. Always maintain active endpoint protection (e.g., Microsoft Defender) and verified offline backups.

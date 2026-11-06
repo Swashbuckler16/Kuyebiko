@@ -39,3 +39,7 @@ class QueueFullError(ProcessingError):
 
 class WorkerLifecycleError(ProcessingError):
     """Raised when an invalid worker lifecycle state transition is attempted."""
+
+
+class PipelineLifecycleError(ProcessingError):
+    """Raised when an invalid pipeline lifecycle transition occurs or stop fails."""

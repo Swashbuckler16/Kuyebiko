@@ -168,3 +168,28 @@ def test_deduplicator_thread_safety():
         t.join()
 
     assert dedup.get_metrics().total_examined == num_threads * events_per_thread
+
+
+def test_deduplicator_ttl_expiry():
+    """Verify that fingerprints older than ttl_seconds are expired and evicted."""
+    ttl_s = 2.0
+    dedup = EventDeduplicator(max_cache_size=10, ttl_seconds=ttl_s)
+    notif = _make_notification(path="doc.txt", monotonic_ns=1_000)
+
+    # Ingest at t = 1.0 second (1_000_000_000 ns)
+    t1_ns = 1_000_000_000
+    assert dedup.is_duplicate(notif, current_monotonic_ns=t1_ns) is False
+
+    # Within TTL (t = 2.0s, delta 1s < 2s): should be detected as duplicate
+    t2_ns = 2_000_000_000
+    assert dedup.is_duplicate(notif, current_monotonic_ns=t2_ns) is True
+    assert dedup.get_metrics().duplicates_suppressed == 1
+
+    # After TTL has elapsed (t = 4.0s, delta 3s > 2s): expired!
+    t3_ns = 4_000_000_000
+    # Notification with same fingerprint is now admitted because previous entry expired
+    assert dedup.is_duplicate(notif, current_monotonic_ns=t3_ns) is False
+
+    metrics = dedup.get_metrics()
+    assert metrics.cache_expirations >= 1
+    assert metrics.duplicates_suppressed == 1

@@ -109,6 +109,10 @@ class EventIngestor:
 
         return outcome
 
+    def ingest_callback(self, notification: RawFileNotification) -> None:
+        """Convenience callback method matching the NotificationCallback protocol."""
+        self.ingest(notification)
+
     def __call__(self, notification: RawFileNotification) -> IngestionOutcome:
         """Allow EventIngestor to be used directly as a NotificationCallback."""
         return self.ingest(notification)

@@ -79,3 +79,16 @@ It ensures that native filesystem notification threads (such as `ReadDirectoryCh
    - Normalization and malformed notification errors do not terminate the worker thread.
    - Downstream consumer delivery failures use bounded immediate retries (`max_consumer_retries`) and record permanently failed events.
 
+7. **Pipeline Lifecycle Coordinator (`EventPipeline`):**
+   - Coordinates `MonitoredRootRegistry`, `BoundedEventQueue`, `EventIngestor`, `EventProcessingWorker`, and `PipelineTelemetryAggregator`.
+   - Deterministic startup sequence: (1) state check, (2) root validation, (3) worker start, (4) watcher start, (5) ingestion callback enable.
+   - Automatic rollback: if any watcher fails to start, previously started components are safely stopped and state transitions to `ERROR`.
+   - Deterministic shutdown sequence: (1) stop accepting, (2) stop watchers, (3) drain queue (if `drain=True`), (4) stop worker, (5) verify thread termination.
+   - Safe restart: stops pipeline, re-instantiates queue and worker to avoid stale thread state, and restarts.
+
+8. **Unified Telemetry & Health States (`PipelineTelemetrySnapshot`):**
+   - Distinct loss metrics: exact application drops (`known_application_dropped`) vs kernel overflow occurrences (`kernel_overflow_count`).
+   - Comprehensive component states: accounts for watcher error, worker error, queue degradation, permanently failed consumer deliveries, and buffer overflows.
+   - Strict health states: `HEALTHY`, `DEGRADED`, `ERROR`, `STOPPED`.
+
+

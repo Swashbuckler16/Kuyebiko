@@ -208,3 +208,38 @@ def test_worker_ordering_tracker_integration():
     ordering_metrics = worker.ordering_tracker.get_metrics()
     assert ordering_metrics.total_tracked == 2
     assert ordering_metrics.total_out_of_order == 1
+
+
+def test_worker_rename_pending_vs_correlation_failure():
+    """Verify worker distinguishes pending old-name from correlation failure."""
+    queue = BoundedEventQueue(capacity=10)
+    consumer = InMemoryEventConsumer()
+    worker = EventProcessingWorker(queue=queue, consumer=consumer)
+    worker.start()
+
+    # 1. Old name notification without matching new name in root-1
+    n_old = _make_notification(
+        path="old_name.txt",
+        root_id="root-1",
+        action=WindowsFileAction.RENAMED_OLD_NAME,
+        monotonic_ns=1000,
+    )
+    queue.put_notification(n_old)
+
+    # 2. Unpaired new name notification in root-2 (correlation failure!)
+    n_unpaired_new = _make_notification(
+        path="unpaired_new.txt",
+        root_id="root-2",
+        action=WindowsFileAction.RENAMED_NEW_NAME,
+        monotonic_ns=2000,
+    )
+    queue.put_notification(n_unpaired_new)
+
+    time.sleep(0.15)
+    worker.stop(timeout=2.0)
+
+    metrics = worker.get_metrics()
+    assert metrics.renames_pending == 1
+    assert metrics.rename_correlation_failures == 1
+    # Neither produces a complete FileEvent
+    assert len(consumer) == 0

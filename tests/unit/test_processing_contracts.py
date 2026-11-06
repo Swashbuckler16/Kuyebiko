@@ -7,9 +7,11 @@ from kuyebiko.models.events import EventSource, EventType, FileEvent, TelemetryQ
 from kuyebiko.processing.contracts import (
     CallbackEventConsumer,
     EventConsumer,
+    EventEnvelope,
     IngestionOutcome,
     InMemoryEventConsumer,
 )
+from kuyebiko.processing.ordering import EventOrderingMetadata
 
 
 def _make_dummy_event(sequence_number: int = 1) -> FileEvent:
@@ -112,3 +114,82 @@ def test_in_memory_event_consumer_thread_safety():
         t.join()
 
     assert len(consumer) == num_threads * events_per_thread
+
+
+def test_event_envelope_immutability_and_fields():
+    now_utc = datetime.now(UTC)
+    evt = _make_dummy_event(1)
+    ordering = EventOrderingMetadata(
+        root_id="root-1",
+        observed_at_utc=now_utc,
+        observed_monotonic_ns=1000,
+        processed_at_utc=now_utc,
+        processed_monotonic_ns=3000,
+        latency_ns=2000,
+        latency_ms=0.002,
+        is_out_of_order=False,
+    )
+    envelope = EventEnvelope(event=evt, ordering=ordering)
+    assert envelope.event == evt
+    assert envelope.ordering == ordering
+
+    with pytest.raises((TypeError, ValueError)):
+        envelope.event = evt  # type: ignore[misc]
+
+
+def test_callback_event_consumer_two_args_and_one_arg():
+    now_utc = datetime.now(UTC)
+    # 2-arg callback: receives (event, ordering)
+    received_2arg = []
+
+    def cb2(event: FileEvent, ordering: EventOrderingMetadata | None) -> None:
+        received_2arg.append((event, ordering))
+
+    consumer2 = CallbackEventConsumer(cb2)
+    evt = _make_dummy_event(1)
+    ordering = EventOrderingMetadata(
+        root_id="root-1",
+        observed_at_utc=now_utc,
+        observed_monotonic_ns=1000,
+        processed_at_utc=now_utc,
+        processed_monotonic_ns=3000,
+        latency_ns=2000,
+        latency_ms=0.002,
+        is_out_of_order=False,
+    )
+    consumer2.handle_event(evt, ordering=ordering)
+    assert len(received_2arg) == 1
+    assert received_2arg[0] == (evt, ordering)
+
+    # 1-arg callback: receives (event) only
+    received_1arg = []
+
+    def cb1(event: FileEvent) -> None:
+        received_1arg.append(event)
+
+    consumer1 = CallbackEventConsumer(cb1)
+    consumer1.handle_event(evt, ordering=ordering)
+    assert len(received_1arg) == 1
+    assert received_1arg[0] == evt
+
+
+def test_in_memory_event_consumer_get_envelopes():
+    now_utc = datetime.now(UTC)
+    consumer = InMemoryEventConsumer()
+    evt = _make_dummy_event(1)
+    ordering = EventOrderingMetadata(
+        root_id="root-1",
+        observed_at_utc=now_utc,
+        observed_monotonic_ns=1000,
+        processed_at_utc=now_utc,
+        processed_monotonic_ns=3000,
+        latency_ns=2000,
+        latency_ms=0.002,
+        is_out_of_order=False,
+    )
+    consumer.handle_event(evt, ordering=ordering)
+
+    envelopes = consumer.get_envelopes()
+    assert len(envelopes) == 1
+    assert envelopes[0].event == evt
+    assert envelopes[0].ordering == ordering

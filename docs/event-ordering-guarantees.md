@@ -42,3 +42,25 @@ When multiple directory roots are monitored simultaneously:
 - `monotonic_ns` is valid only for durations within the same system boot session.
 - It is never compared across system restarts or external systems.
 - Wall-clock timestamps (`timestamp_utc`) are always normalized to UTC.
+
+---
+
+## 4. Downstream Propagation & Delivery Semantics
+
+### 4.1 EventEnvelope & Ordering Metadata Propagation
+- Downstream consumers receive `FileEvent` objects alongside `EventOrderingMetadata` via `EventConsumer.handle_event(event, ordering=ordering_meta)`.
+- Consumers that buffer events (such as `InMemoryEventConsumer`) provide `get_envelopes()` returning immutable `EventEnvelope(event=event, ordering=ordering)` objects.
+- `EventOrderingMetadata` contains:
+  - `root_id`: Monitored root identifier.
+  - `observed_at_utc`, `observed_monotonic_ns`: Preserved original observation timestamps.
+  - `processed_at_utc`, `processed_monotonic_ns`: Timestamp when the pipeline worker processed the event.
+  - `latency_ns`, `latency_ms`: Measured transit latency through the pipeline.
+  - `is_out_of_order`: Boolean flag indicating retrograde monotonic timestamp within the root.
+
+### 4.2 Delivery Semantics (At-Least-Once with Bounded Retries)
+- Downstream delivery provides **at-least-once** delivery semantics.
+- If a consumer raises an unhandled exception, `EventProcessingWorker` performs bounded immediate retries (`max_consumer_retries`, default 1 retry).
+- **Consumer Idempotency:** Because an ambiguous failure could occur after a consumer has already initiated partial side-effects, downstream consumers **must be idempotent**.
+- Events that fail all retry attempts are recorded as `permanently_failed_events` and cause `PipelineHealth` to degrade rather than silently disappearing.
+
+

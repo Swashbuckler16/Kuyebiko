@@ -8,6 +8,7 @@ from kuyebiko.collectors.normalizer import EventNormalizer
 from kuyebiko.processing.contracts import (
     CallbackEventConsumer,
     EventConsumer,
+    EventEnvelope,
     IngestionOutcome,
     InMemoryEventConsumer,
 )
@@ -22,8 +23,13 @@ from kuyebiko.processing.ordering import (
     EventOrderingTracker,
     OrderingMetrics,
 )
+from kuyebiko.processing.pipeline import (
+    EventPipeline,
+    PipelineLifecycleState,
+)
 from kuyebiko.processing.queue import BoundedEventQueue, EventQueueMetrics
 from kuyebiko.processing.telemetry import (
+    PipelineHealth,
     PipelineTelemetryAggregator,
     PipelineTelemetrySnapshot,
 )
@@ -39,17 +45,21 @@ __all__ = [
     "DeduplicationMetrics",
     "EventConsumer",
     "EventDeduplicator",
+    "EventEnvelope",
     "EventFingerprint",
     "EventIngestor",
     "EventNormalizer",
     "EventOrderingMetadata",
     "EventOrderingTracker",
+    "EventPipeline",
     "EventProcessingWorker",
     "EventQueueMetrics",
     "IngestionMetrics",
     "IngestionOutcome",
     "InMemoryEventConsumer",
     "OrderingMetrics",
+    "PipelineHealth",
+    "PipelineLifecycleState",
     "PipelineTelemetryAggregator",
     "PipelineTelemetrySnapshot",
     "WorkerLifecycleState",

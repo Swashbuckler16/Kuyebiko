@@ -7,6 +7,7 @@ or create-modify-rename sequences essential for ransomware behavior detection.
 
 import logging
 import threading
+import time
 from collections import OrderedDict
 from typing import NamedTuple
 
@@ -36,6 +37,7 @@ class DeduplicationMetrics(BaseModel):
     duplicates_suppressed: int = Field(ge=0)
     cache_size: int = Field(ge=0)
     cache_evictions: int = Field(ge=0)
+    cache_expirations: int = Field(default=0, ge=0)
     deduplication_errors: int = Field(ge=0)
 
 
@@ -43,44 +45,70 @@ class EventDeduplicator:
     """Thread-safe conservative deduplicator for raw filesystem notifications.
 
     Only filters true duplicate notifications (identical root, path, action,
-    and observation monotonic timestamp). Never suppresses successive writes,
-    distinct modifications, or create-modify progressions across time.
+    and observation monotonic timestamp). Evicts stale entries based on a
+    time-to-live (TTL) window and bounds memory capacity with FIFO eviction.
     """
 
     def __init__(
         self,
         max_cache_size: int = 1000,
+        ttl_seconds: float = 5.0,
         enabled: bool = True,
     ) -> None:
         """Initialize the deduplicator.
 
         Args:
             max_cache_size: Maximum entries retained in the bounded fingerprint cache.
+            ttl_seconds: Time-to-live in seconds before cache entries expire.
             enabled: If False, all notifications pass through without suppression.
         """
         if max_cache_size < 1:
             raise ValueError(f"max_cache_size must be at least 1, got {max_cache_size}")
+        if ttl_seconds <= 0.0:
+            raise ValueError(f"ttl_seconds must be positive, got {ttl_seconds}")
 
         self._max_cache_size = max_cache_size
+        self._ttl_ns = int(ttl_seconds * 1_000_000_000)
         self._enabled = enabled
-        self._cache: OrderedDict[EventFingerprint, None] = OrderedDict()
+        # Maps EventFingerprint -> inserted_monotonic_ns
+        self._cache: OrderedDict[EventFingerprint, int] = OrderedDict()
         self._lock = threading.Lock()
 
         # Operational metrics
         self._total_examined = 0
         self._duplicates_suppressed = 0
         self._cache_evictions = 0
+        self._cache_expirations = 0
         self._deduplication_errors = 0
 
     @property
     def enabled(self) -> bool:
         return self._enabled
 
-    def is_duplicate(self, notification: RawFileNotification) -> bool:
+    @property
+    def ttl_seconds(self) -> float:
+        return self._ttl_ns / 1_000_000_000.0
+
+    def _evict_expired(self, now_ns: int) -> None:
+        """Evict stale entries that exceeded the TTL window."""
+        while self._cache:
+            first_fingerprint, inserted_ns = next(iter(self._cache.items()))
+            if now_ns - inserted_ns > self._ttl_ns:
+                self._cache.popitem(last=False)
+                self._cache_expirations += 1
+            else:
+                break
+
+    def is_duplicate(
+        self,
+        notification: RawFileNotification,
+        current_monotonic_ns: int | None = None,
+    ) -> bool:
         """Evaluate whether a notification is an exact duplicate.
 
         Args:
             notification: The RawFileNotification to inspect.
+            current_monotonic_ns: Optional current monotonic timestamp for testing.
 
         Returns:
             True if the notification is a suppressed duplicate, False otherwise.
@@ -95,6 +123,12 @@ class EventDeduplicator:
                 self._deduplication_errors += 1
             return False
 
+        now_ns = (
+            current_monotonic_ns
+            if current_monotonic_ns is not None
+            else time.monotonic_ns()
+        )
+
         fingerprint = EventFingerprint(
             root_id=notification.root_id,
             relative_path=notification.relative_path,
@@ -105,6 +139,9 @@ class EventDeduplicator:
 
         with self._lock:
             self._total_examined += 1
+
+            # Evict expired entries before checking
+            self._evict_expired(now_ns)
 
             if fingerprint in self._cache:
                 self._duplicates_suppressed += 1
@@ -117,12 +154,12 @@ class EventDeduplicator:
                 )
                 return True
 
-            # Insert into bounded cache
+            # Insert into bounded cache with FIFO eviction on capacity overflow
             if len(self._cache) >= self._max_cache_size:
                 self._cache.popitem(last=False)
                 self._cache_evictions += 1
 
-            self._cache[fingerprint] = None
+            self._cache[fingerprint] = now_ns
             return False
 
     def clear(self) -> None:
@@ -138,5 +175,6 @@ class EventDeduplicator:
                 duplicates_suppressed=self._duplicates_suppressed,
                 cache_size=len(self._cache),
                 cache_evictions=self._cache_evictions,
+                cache_expirations=self._cache_expirations,
                 deduplication_errors=self._deduplication_errors,
             )

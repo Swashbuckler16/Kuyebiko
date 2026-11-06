@@ -10,7 +10,9 @@ from kuyebiko.collectors.windows.watcher import WindowsDirectoryWatcher
 from kuyebiko.models.events import EventType
 from kuyebiko.processing.contracts import InMemoryEventConsumer
 from kuyebiko.processing.ingestion import EventIngestor
+from kuyebiko.processing.pipeline import EventPipeline, PipelineLifecycleState
 from kuyebiko.processing.queue import BoundedEventQueue
+from kuyebiko.processing.telemetry import PipelineHealth
 from kuyebiko.processing.worker import EventProcessingWorker
 
 pytestmark = pytest.mark.skipif(
@@ -146,3 +148,39 @@ def test_multi_root_registry_to_event_pipeline(tmp_path: Path):
     assert len(beta_events) >= 1
     assert alpha_events[0].file_path == "alpha_doc.txt"
     assert beta_events[0].file_path == "beta_doc.txt"
+
+
+def test_event_pipeline_coordinator_live_windows(tmp_path: Path):
+    """End-to-end integration test of EventPipeline with live directory watcher."""
+    work_dir = tmp_path / "coordinator_root"
+    work_dir.mkdir()
+
+    root = MonitoredRoot(root_id="live-root", path=work_dir)
+    consumer = InMemoryEventConsumer()
+    pipeline = EventPipeline(consumer=consumer, poll_timeout=0.01)
+    pipeline.register_root(root)
+
+    assert pipeline.state == PipelineLifecycleState.STOPPED
+    pipeline.start()
+    assert pipeline.state == PipelineLifecycleState.RUNNING
+
+    try:
+        # Create a file
+        f = work_dir / "live_test.txt"
+        f.write_text("live data", encoding="utf-8")
+
+        assert _wait_for_condition(
+            lambda: any(e.file_path == "live_test.txt" for e in consumer.get_events()),
+            timeout=3.0,
+        )
+
+        snap = pipeline.snapshot()
+        assert snap.health == PipelineHealth.HEALTHY
+        assert snap.registered_watchers == 1
+        assert snap.active_watchers == 1
+        assert snap.total_submitted >= 1
+    finally:
+        pipeline.stop(timeout=3.0, drain=True)
+
+    assert pipeline.state == PipelineLifecycleState.STOPPED
+    assert pipeline.is_running is False

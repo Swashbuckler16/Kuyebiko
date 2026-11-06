@@ -52,9 +52,14 @@ def test_separate_kernel_and_application_overflow_counts():
     assert isinstance(snapshot, PipelineTelemetrySnapshot)
     assert snapshot.kernel_overflow_count == 5
     assert snapshot.application_queue_overflow_count == 2
-    assert snapshot.total_dropped == 7  # 5 kernel + 2 app
+    assert snapshot.known_application_dropped == 2
+    # Exact known application drops only (not conflated with kernel overflow count)
+    assert snapshot.total_dropped == 2
+    assert snapshot.uncounted_kernel_loss is True
     assert snapshot.telemetry_degraded is True
-    assert any("exhausted" in r for r in snapshot.degradation_reasons)
+    assert any(
+        "exhausted" in r or "overflow" in r for r in snapshot.degradation_reasons
+    )
 
 
 def test_backpressure_high_watermark_tracking():
@@ -124,7 +129,7 @@ def test_telemetry_snapshot_frozen():
 def test_telemetry_aggregator_with_degraded_watcher():
     class DummyWatcher:
         def __init__(self):
-            self._overflow_count = 3
+            self.overflow_count = 3
             self.health = WatcherHealth.DEGRADED
             self.degradation_reasons = ["Kernel buffer overflow in driver"]
 

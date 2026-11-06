@@ -30,8 +30,12 @@ Kuyebiko guarantees that the following valid sequences are **never** suppressed:
 
 ---
 
-## 4. Cache Bounding and Memory Limits
+## 4. Cache Bounding, TTL Expiry, and Memory Limits
 
-- The fingerprint cache uses a bounded `OrderedDict` (default capacity `1,000` entries).
-- When capacity is reached, the oldest fingerprint is evicted (`FIFO` policy), incrementing `cache_evictions`.
-- Memory is strictly $O(1)$ with respect to total processed events.
+- The fingerprint cache uses a bounded `OrderedDict` (default capacity `10,000` entries).
+- **Time-to-Live (TTL):** Each cached fingerprint has an explicit lifetime (`ttl_seconds: float = 5.0` default).
+- On cache inspection, entries exceeding `ttl_seconds` are evicted, incrementing `cache_expirations`.
+- When capacity is reached before TTL expiration, the oldest fingerprint is evicted (`FIFO` policy), incrementing `cache_evictions`.
+- Cache access, mutation, and eviction are strictly synchronized with a threading lock.
+- Memory usage is strictly bounded and $O(1)$ with respect to total processed events over time.
+

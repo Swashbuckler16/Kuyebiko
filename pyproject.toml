@@ -9,6 +9,20 @@ version = "0.1.0"
 description = "A local-first Windows ransomware behaviour monitoring and investigation platform."
 readme = "README.md"
 requires-python = ">=3.12"
+license = { text = "GPL-3.0-or-later" }
+authors = [
+    { name = "Atharva Ghag", email = "atharva.vinod.ghag@gmail.com" },
+]
+maintainers = [
+    { name = "Atharva Ghag", email = "atharva.vinod.ghag@gmail.com" },
+]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
 
 dependencies = [
     "pydantic>=2.10",

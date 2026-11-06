@@ -14,7 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from kuyebiko.collectors.models import RawFileNotification
+from kuyebiko.collectors.models import RawFileNotification, WindowsFileAction
 from kuyebiko.collectors.normalizer import EventNormalizer
 from kuyebiko.collectors.rename_correlator import RenameCorrelator
 from kuyebiko.core.exceptions import NormalizationError, WorkerLifecycleError
@@ -307,7 +307,7 @@ class EventProcessingWorker:
             return
 
         # Track event chronology and latency
-        self._ordering_tracker.track(item)
+        ordering_meta = self._ordering_tracker.track(item)
 
         # Check conservative deduplication if enabled
         if self._deduplicator is not None and self._deduplicator.is_duplicate(item):
@@ -315,12 +315,19 @@ class EventProcessingWorker:
                 self._duplicates_suppressed += 1
             return
 
+        is_rename_action = hasattr(item, "action") and item.action in (
+            WindowsFileAction.RENAMED_OLD_NAME,
+            WindowsFileAction.RENAMED_NEW_NAME,
+        )
+
         # Normalize notification into a validated FileEvent
         try:
             event: FileEvent | None = self._normalizer.normalize_notification(item)
         except NormalizationError as err:
             with self._lock:
                 self._normalization_failures += 1
+                if is_rename_action:
+                    self._rename_correlation_failures += 1
             logger.warning(
                 "Normalization failed for notification in root '%s': %s",
                 item.root_id,
@@ -331,6 +338,8 @@ class EventProcessingWorker:
             with self._lock:
                 self._normalization_failures += 1
                 self._unexpected_processing_errors += 1
+                if is_rename_action:
+                    self._rename_correlation_failures += 1
             logger.error(
                 "Unexpected exception normalizing notification in root '%s': %s",
                 item.root_id,
@@ -338,10 +347,23 @@ class EventProcessingWorker:
             )
             return
 
-        # If normalization produced None (e.g. rename pending correlation)
+        # If normalization produced None
         if event is None:
             with self._lock:
-                self._renames_pending += 1
+                if (
+                    hasattr(item, "action")
+                    and item.action == WindowsFileAction.RENAMED_NEW_NAME
+                ):
+                    # Unpaired new name or expired: correlation failure!
+                    self._rename_correlation_failures += 1
+                    logger.warning(
+                        "Rename correlation failed for '%s' in root '%s'",
+                        item.relative_path,
+                        item.root_id,
+                    )
+                else:
+                    # Normal pending old rename waiting for matching new rename
+                    self._renames_pending += 1
             logger.debug(
                 "Notification for root '%s' path '%s' pending correlation",
                 item.root_id,
@@ -352,13 +374,13 @@ class EventProcessingWorker:
         with self._lock:
             self._notifications_normalized += 1
 
-        # Deliver to downstream consumer with bounded retry
+        # Deliver to consumer with bounded retry (at-least-once semantics)
         delivered = False
         attempts = self._max_consumer_retries + 1
 
         for attempt in range(attempts):
             try:
-                self._consumer.handle_event(event)
+                self._consumer.handle_event(event, ordering=ordering_meta)
                 delivered = True
                 break
             except Exception as err:
