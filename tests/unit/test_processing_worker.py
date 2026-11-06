@@ -217,7 +217,11 @@ def test_worker_consumer_exception_isolation():
         if "crash" in event.file_path:
             raise RuntimeError("Consumer crash simulation")
 
-    worker = EventProcessingWorker(queue=queue, consumer=crashing_consumer)
+    worker = EventProcessingWorker(
+        queue=queue,
+        consumer=crashing_consumer,
+        max_consumer_retries=0,
+    )
     worker.start()
 
     queue.put_notification(_make_notification(path="crash_file.txt"))

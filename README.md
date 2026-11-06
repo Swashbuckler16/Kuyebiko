@@ -34,13 +34,16 @@ Kuyebiko operates with complete local data sovereignty: file contents are **neve
 
 ## 3. Current Implementation Status
 
-Kuyebiko is actively under development. Below is the verified status of the codebase at **Phase 3 Active (Steps 3.1 through 3.4 Complete)**:
+Kuyebiko is actively under development. Below is the verified status of the codebase at **Phase 3 Active (Steps 3.1 through 3.9 Complete)**:
 
 ### Implemented Functionality (Tested & Active)
 - **Event Processing & Ingestion Subsystem (`src/kuyebiko/processing/`):**
   - `EventIngestor` (`processing/ingestion.py`): Fast, thread-safe ingestion interface connecting filesystem watchers and multi-root registries to the processing pipeline. Validates input types, tracks per-root counts, and emits type-safe `IngestionOutcome` status (`ACCEPTED`, `QUEUE_FULL`, `REJECTED`, `SHUTTING_DOWN`).
   - `BoundedEventQueue` (`processing/queue.py`): Thread-safe bounded buffer wrapping standard library `queue.Queue` with configurable capacity (`KUYEBIKO_EVENT_QUEUE_SIZE`), non-blocking submission semantics, high-watermark tracking, and telemetry degradation on saturation with automatic recovery.
-  - `EventProcessingWorker` (`processing/worker.py`): Dedicated background worker thread executing strictly sequenced event normalization, rename correlation, error isolation, and downstream event dispatch with graceful shutdown draining.
+  - `EventProcessingWorker` (`processing/worker.py`): Dedicated background worker thread executing strictly sequenced event normalization, rename correlation, error isolation, bounded retries, and downstream event dispatch with graceful shutdown draining.
+  - `EventDeduplicator` (`processing/deduplication.py`): Conservative duplicate event filter with bounded fingerprint cache. Suppresses only exact duplicate notification deliveries while strictly preserving legitimate sequential writes, multi-chunk modifications, and create-modify sequences.
+  - `EventOrderingTracker` (`processing/ordering.py`): Chronology and latency tracking per monitored root. Detects out-of-order event arrivals and monitors processing latency without corrupting observation timestamps or stalling the pipeline.
+  - `PipelineTelemetryAggregator` (`processing/telemetry.py`): Structured telemetry aggregator providing separate accounting for Windows kernel buffer overflows (`ERROR_NOTIFY_ENUM_DIR`) vs. application queue backpressure drops (`QUEUE_FULL`).
   - Downstream Consumer Protocol (`processing/contracts.py`): Extensible `@runtime_checkable` `EventConsumer` protocol with reference `CallbackEventConsumer` and thread-safe `InMemoryEventConsumer` implementations.
 - **Windows Filesystem Watcher & Collectors Subsystem (`src/kuyebiko/collectors/`):**
   - `WindowsDirectoryWatcher`: Native Windows directory watcher utilizing `ReadDirectoryChangesW` via standard library `ctypes`. Operates in a dedicated background worker thread with non-blocking graceful cancellation via `CancelIoEx`.
@@ -72,9 +75,9 @@ Kuyebiko is actively under development. Below is the verified status of the code
 - **Centralized Diagnostic Logging (`src/kuyebiko/utils/logging_config.py`):**
   - Rotating file logger (`5 MB` max size, `5` backup archives) and stream console logger with clean formatting and shutdown handlers.
 - **Automated Test Suite (`tests/`):**
-  - **183 comprehensive unit tests** (`tests/unit/`) validating event processing contracts, bounded queues, ingestion backpressure, worker thread lifecycles, collectors, parsers, normalizers, and domain schemas.
+  - **221 comprehensive unit tests** (`tests/unit/`) validating event processing contracts, bounded queues, ingestion backpressure, conservative deduplication, ordering tracking, worker thread lifecycles, error isolation, collectors, parsers, normalizers, and domain schemas.
   - **15 integration tests** (`tests/integration/`) verifying live Windows `ReadDirectoryChangesW` filesystem events, end-to-end watcher-to-worker pipeline dispatch, multi-root registry routing, and async database WAL operations.
-  - **198 total passing tests** with **93% overall code coverage**.
+  - **236 total passing tests** with **94% overall code coverage**.
 
 > [!IMPORTANT]
 > **Windows Monitoring Architecture & Limitations:**
@@ -146,9 +149,12 @@ Kuyebiko/
 │       ├── processing/           # Normalization, bounded queue, worker (Implemented)
 │       │   ├── __init__.py       # Processing exports
 │       │   ├── contracts.py      # EventConsumer protocol, outcomes, reference consumers
+│       │   ├── deduplication.py  # EventDeduplicator conservative filter
 │       │   ├── ingestion.py      # EventIngestor pipeline interface
+│       │   ├── ordering.py       # EventOrderingTracker chronology and latency
 │       │   ├── queue.py          # BoundedEventQueue and EventQueueMetrics
-│       │   └── worker.py         # EventProcessingWorker thread
+│       │   ├── telemetry.py      # PipelineTelemetryAggregator and backpressure snapshot
+│       │   └── worker.py         # EventProcessingWorker thread with retry isolation
 │       ├── detection/            # Signal evaluators and scoring engine (Phase 4)
 │       ├── storage/              # Database engine and migrations
 │       │   ├── __init__.py

@@ -2,7 +2,8 @@
 
 Consumes RawFileNotification objects from the bounded event queue, converts them
 into validated FileEvent instances using EventNormalizer and RenameCorrelator, and
-dispatches them to registered downstream EventConsumer components.
+dispatches them to registered downstream EventConsumer components with ordering
+tracking, conservative deduplication, and isolated bounded retries.
 """
 
 import logging
@@ -23,6 +24,8 @@ from kuyebiko.processing.contracts import (
     EventConsumer,
     InMemoryEventConsumer,
 )
+from kuyebiko.processing.deduplication import EventDeduplicator
+from kuyebiko.processing.ordering import EventOrderingTracker
 from kuyebiko.processing.queue import BoundedEventQueue
 
 logger = logging.getLogger("kuyebiko.processing.worker")
@@ -52,6 +55,18 @@ class WorkerMetrics(BaseModel):
     events_delivered: int = Field(ge=0)
     consumer_errors: int = Field(ge=0)
     unexpected_errors: int = Field(ge=0)
+
+    # Extended Step 3.9 error and lifecycle metrics
+    invalid_notifications: int = Field(default=0, ge=0)
+    normalization_failures: int = Field(default=0, ge=0)
+    rename_correlation_failures: int = Field(default=0, ge=0)
+    consumer_delivery_failures: int = Field(default=0, ge=0)
+    retry_attempts: int = Field(default=0, ge=0)
+    permanently_failed_events: int = Field(default=0, ge=0)
+    unexpected_processing_errors: int = Field(default=0, ge=0)
+    worker_failures: int = Field(default=0, ge=0)
+    duplicates_suppressed: int = Field(default=0, ge=0)
+
     state: WorkerLifecycleState
 
 
@@ -68,7 +83,10 @@ class EventProcessingWorker:
         queue: BoundedEventQueue,
         consumer: EventConsumer | Any | None = None,
         normalizer: EventNormalizer | None = None,
+        deduplicator: EventDeduplicator | None = None,
+        ordering_tracker: EventOrderingTracker | None = None,
         poll_timeout: float = 0.1,
+        max_consumer_retries: int = 1,
     ) -> None:
         """Initialize the processing worker.
 
@@ -78,7 +96,11 @@ class EventProcessingWorker:
                 or None (defaults to an InMemoryEventConsumer).
             normalizer: EventNormalizer instance (defaults to normalizer
                 with RenameCorrelator).
+            deduplicator: Optional conservative EventDeduplicator instance.
+            ordering_tracker: Optional EventOrderingTracker instance.
             poll_timeout: Queue polling interval in seconds for checking stop signals.
+            max_consumer_retries: Maximum immediate retries for downstream
+                consumer failures.
         """
         if not isinstance(queue, BoundedEventQueue):
             raise TypeError(
@@ -102,7 +124,10 @@ class EventProcessingWorker:
         self._normalizer = normalizer or EventNormalizer(
             rename_correlator=RenameCorrelator()
         )
+        self._deduplicator = deduplicator
+        self._ordering_tracker = ordering_tracker or EventOrderingTracker()
         self._poll_timeout = max(0.01, poll_timeout)
+        self._max_consumer_retries = max(0, max_consumer_retries)
 
         self._thread: threading.Thread | None = None
         self._state = WorkerLifecycleState.STOPPED
@@ -113,15 +138,31 @@ class EventProcessingWorker:
         self._notifications_received = 0
         self._notifications_normalized = 0
         self._renames_pending = 0
-        self._normalization_errors = 0
         self._events_delivered = 0
-        self._consumer_errors = 0
-        self._unexpected_errors = 0
+
+        # Extended error and retry metrics
+        self._invalid_notifications = 0
+        self._normalization_failures = 0
+        self._rename_correlation_failures = 0
+        self._consumer_delivery_failures = 0
+        self._retry_attempts = 0
+        self._permanently_failed_events = 0
+        self._unexpected_processing_errors = 0
+        self._worker_failures = 0
+        self._duplicates_suppressed = 0
 
     @property
     def state(self) -> WorkerLifecycleState:
         with self._lock:
             return self._state
+
+    @property
+    def ordering_tracker(self) -> EventOrderingTracker:
+        return self._ordering_tracker
+
+    @property
+    def deduplicator(self) -> EventDeduplicator | None:
+        return self._deduplicator
 
     def is_running(self) -> bool:
         with self._lock:
@@ -156,6 +197,7 @@ class EventProcessingWorker:
                 logger.info("EventProcessingWorker started successfully")
             except Exception as err:
                 self._state = WorkerLifecycleState.ERROR
+                self._worker_failures += 1
                 logger.critical("Failed to start EventProcessingWorker thread: %s", err)
                 raise WorkerLifecycleError(
                     f"Failed to start worker thread: {err}"
@@ -200,6 +242,7 @@ class EventProcessingWorker:
             if thread.is_alive():
                 with self._lock:
                     self._state = WorkerLifecycleState.ERROR
+                    self._worker_failures += 1
                 msg = (
                     f"EventProcessingWorker thread failed to terminate within "
                     f"{timeout}s timeout"
@@ -212,6 +255,11 @@ class EventProcessingWorker:
             self._thread = None
 
         logger.info("EventProcessingWorker stopped cleanly")
+
+    def restart(self, timeout: float = 5.0) -> None:
+        """Safely stop and restart the worker thread."""
+        self.stop(timeout=timeout, drain=False)
+        self.start()
 
     def _run_loop(self) -> None:
         """Main processing loop executed on the worker thread."""
@@ -236,7 +284,7 @@ class EventProcessingWorker:
                 self._process_single_item(item)
             except Exception as err:
                 with self._lock:
-                    self._unexpected_errors += 1
+                    self._unexpected_processing_errors += 1
                 logger.exception("Unexpected error in event processing loop: %s", err)
             finally:
                 self._queue.task_done()
@@ -250,11 +298,21 @@ class EventProcessingWorker:
 
         if not isinstance(item, RawFileNotification):
             with self._lock:
-                self._normalization_errors += 1
+                self._invalid_notifications += 1
+                self._normalization_failures += 1
             logger.warning(
                 "Skipping non-RawFileNotification item of type '%s'",
                 type(item).__name__,
             )
+            return
+
+        # Track event chronology and latency
+        self._ordering_tracker.track(item)
+
+        # Check conservative deduplication if enabled
+        if self._deduplicator is not None and self._deduplicator.is_duplicate(item):
+            with self._lock:
+                self._duplicates_suppressed += 1
             return
 
         # Normalize notification into a validated FileEvent
@@ -262,7 +320,7 @@ class EventProcessingWorker:
             event: FileEvent | None = self._normalizer.normalize_notification(item)
         except NormalizationError as err:
             with self._lock:
-                self._normalization_errors += 1
+                self._normalization_failures += 1
             logger.warning(
                 "Normalization failed for notification in root '%s': %s",
                 item.root_id,
@@ -271,7 +329,8 @@ class EventProcessingWorker:
             return
         except Exception as err:
             with self._lock:
-                self._normalization_errors += 1
+                self._normalization_failures += 1
+                self._unexpected_processing_errors += 1
             logger.error(
                 "Unexpected exception normalizing notification in root '%s': %s",
                 item.root_id,
@@ -293,19 +352,39 @@ class EventProcessingWorker:
         with self._lock:
             self._notifications_normalized += 1
 
-        # Deliver to downstream consumer
-        try:
-            self._consumer.handle_event(event)
+        # Deliver to downstream consumer with bounded retry
+        delivered = False
+        attempts = self._max_consumer_retries + 1
+
+        for attempt in range(attempts):
+            try:
+                self._consumer.handle_event(event)
+                delivered = True
+                break
+            except Exception as err:
+                with self._lock:
+                    self._consumer_delivery_failures += 1
+                    if attempt < self._max_consumer_retries:
+                        self._retry_attempts += 1
+                logger.warning(
+                    "Consumer '%s' failed handling event '%s' (attempt %d/%d): %s",
+                    type(self._consumer).__name__,
+                    event.event_id,
+                    attempt + 1,
+                    attempts,
+                    err,
+                )
+
+        if delivered:
             with self._lock:
                 self._events_delivered += 1
-        except Exception as err:
+        else:
             with self._lock:
-                self._consumer_errors += 1
+                self._permanently_failed_events += 1
             logger.error(
-                "Downstream consumer '%s' failed handling event '%s': %s",
-                type(self._consumer).__name__,
+                "Event '%s' permanently failed downstream delivery after %d attempts",
                 event.event_id,
-                err,
+                attempts,
             )
 
     def get_metrics(self) -> WorkerMetrics:
@@ -315,9 +394,18 @@ class EventProcessingWorker:
                 notifications_received=self._notifications_received,
                 notifications_normalized=self._notifications_normalized,
                 renames_pending=self._renames_pending,
-                normalization_errors=self._normalization_errors,
+                normalization_errors=self._normalization_failures,
                 events_delivered=self._events_delivered,
-                consumer_errors=self._consumer_errors,
-                unexpected_errors=self._unexpected_errors,
+                consumer_errors=self._consumer_delivery_failures,
+                unexpected_errors=self._unexpected_processing_errors,
+                invalid_notifications=self._invalid_notifications,
+                normalization_failures=self._normalization_failures,
+                rename_correlation_failures=self._rename_correlation_failures,
+                consumer_delivery_failures=self._consumer_delivery_failures,
+                retry_attempts=self._retry_attempts,
+                permanently_failed_events=self._permanently_failed_events,
+                unexpected_processing_errors=self._unexpected_processing_errors,
+                worker_failures=self._worker_failures,
+                duplicates_suppressed=self._duplicates_suppressed,
                 state=self._state,
             )

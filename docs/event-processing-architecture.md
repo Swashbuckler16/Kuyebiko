@@ -28,13 +28,14 @@ It ensures that native filesystem notification threads (such as `ReadDirectoryCh
       - Standard library queue.Queue
       - Configurable capacity (KUYEBIKO_EVENT_QUEUE_SIZE)
       - Non-blocking submission
-      - Degradation & overflow accounting
+      - Degradation & application overflow accounting
                 │
                 ▼
    [ EventProcessingWorker ] (Single Dedicated Background Thread)
       - Consumes RawFileNotification
-      - Predictable sequential ordering
-      - Graceful lifecycle management
+      - EventOrderingTracker (tracks chronology, latency, out-of-order)
+      - EventDeduplicator (conservative filter: never suppresses successive writes)
+      - Graceful lifecycle management with bounded consumer retry
                 │
                 ▼
    [ EventNormalizer + RenameCorrelator ] (Reused Phase 2 Core)
@@ -61,11 +62,20 @@ It ensures that native filesystem notification threads (such as `ReadDirectoryCh
    - Watcher callbacks return immediately after submitting notifications to `BoundedEventQueue`.
    - Never block watcher threads on disk I/O, database persistence, or CPU-intensive analysis.
 
-3. **Explicit Degradation vs. Silent Drops:**
-   - Queue overflows are explicitly reported as `IngestionOutcome.QUEUE_FULL`.
+3. **Explicit Degradation & Separate Overflow Accounting:**
+   - Separate metrics: Windows kernel buffer drops (`ERROR_NOTIFY_ENUM_DIR` / 1022) vs. Kuyebiko application queue overflow (`QUEUE_FULL`).
    - Overflow metrics and telemetry degradation states are recorded.
    - Queue overflows indicate high I/O burst pressure, not malicious ransomware behaviour.
 
-4. **Extensible Consumer Protocol:**
-   - Downstream consumers implement `EventConsumer.handle_event(event: FileEvent)`.
-   - Allows drop-in replacement by testing fixtures, logging observers, or the Phase 4 detection pipeline.
+4. **Conservative Deduplication:**
+   - Only exact duplicate notifications (same root, path, action, and identical monotonic timestamp) are filtered.
+   - Legitimate repeated modifications, multi-chunk writes, and create-modify sequences are never suppressed.
+
+5. **Chronology & Out-of-Order Tracking:**
+   - Original observation timestamps (`observed_at`, `monotonic_ns`) are strictly preserved.
+   - Multi-root streams are monitored independently for out-of-order occurrences without artificial re-sorting buffers.
+
+6. **Error Isolation & Bounded Retries:**
+   - Normalization and malformed notification errors do not terminate the worker thread.
+   - Downstream consumer delivery failures use bounded immediate retries (`max_consumer_retries`) and record permanently failed events.
+
