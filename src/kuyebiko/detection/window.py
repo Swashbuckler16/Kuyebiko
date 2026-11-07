@@ -1,9 +1,11 @@
 """Sliding-window event correlation and statistical aggregation.
 
 Provides chronological, bounded per-root event buffering, monotonic time-based
-expiration, and O(1) incremental aggregation for behavioural ransomware signals.
+expiration, out-of-order handling, and O(1) incremental aggregation for
+behavioural ransomware signals.
 """
 
+import bisect
 import logging
 import posixpath
 import threading
@@ -44,8 +46,9 @@ class RootSlidingWindow:
         self._max_events = max_events
 
         self._lock = threading.RLock()
-        self._events: deque[FileEvent] = deque()
-        self._ordering_meta: deque[EventOrderingMetadata | None] = deque()
+        # Chronologically sorted list of events and ordering metadata
+        self._events: list[FileEvent] = []
+        self._ordering_meta: list[EventOrderingMetadata | None] = []
 
         # Incremental counters for O(1) access
         self._created_count = 0
@@ -59,7 +62,11 @@ class RootSlidingWindow:
         self._ext_counts: Counter[str] = Counter()
         self._dir_counts: Counter[str] = Counter()
 
-        self._capacity_dropped_events = 0
+        # Capacity drop tracking with recovery: drops within active horizon
+        self._capacity_drop_timestamps: deque[int] = deque()
+        self._cumulative_capacity_dropped: int = 0
+        self._expired_retrograde_drops: int = 0
+
         self._last_event_monotonic_ns: int | None = None
         self._last_event_utc: datetime | None = None
 
@@ -73,8 +80,21 @@ class RootSlidingWindow:
 
     @property
     def capacity_dropped_events(self) -> int:
+        """Active capacity drops within the current sliding window horizon."""
         with self._lock:
-            return self._capacity_dropped_events
+            return len(self._capacity_drop_timestamps)
+
+    @property
+    def active_capacity_dropped_events(self) -> int:
+        """Active capacity drops within the current sliding window horizon."""
+        with self._lock:
+            return len(self._capacity_drop_timestamps)
+
+    @property
+    def cumulative_capacity_dropped_events(self) -> int:
+        """Total cumulative capacity drops since window creation."""
+        with self._lock:
+            return self._cumulative_capacity_dropped
 
     def add_event(
         self,
@@ -82,7 +102,7 @@ class RootSlidingWindow:
         ordering: EventOrderingMetadata | None = None,
         now_monotonic_ns: int | None = None,
     ) -> None:
-        """Append a normalized FileEvent and update incremental statistics."""
+        """Append or chronologically insert a normalized FileEvent."""
         if event.root_id != self._root_id:
             raise ValueError(
                 f"Event root_id {event.root_id} does not match "
@@ -95,14 +115,30 @@ class RootSlidingWindow:
             )
             self._prune_expired_locked(clock_ns)
 
-            # If capacity is exceeded, evict the oldest event to remain strictly bounded
-            if len(self._events) >= self._max_events:
-                self._evict_oldest_locked()
-                self._capacity_dropped_events += 1
+            # Check if this event arrived out-of-order and is already expired
+            if (clock_ns - event.monotonic_ns) > self._window_duration_ns:
+                # Event is outside active window horizon; do not pollute window
+                self._expired_retrograde_drops += 1
+                return
 
-            self._events.append(event)
-            self._ordering_meta.append(ordering)
+            # Chronological insertion: if newer or empty, append in O(1)
+            if not self._events or event.monotonic_ns >= self._events[-1].monotonic_ns:
+                self._events.append(event)
+                self._ordering_meta.append(ordering)
+            else:
+                # Out-of-order event: insert at exact chronological position via bisect
+                timestamps = [e.monotonic_ns for e in self._events]
+                idx = bisect.bisect_right(timestamps, event.monotonic_ns)
+                self._events.insert(idx, event)
+                self._ordering_meta.insert(idx, ordering)
+
             self._include_event_locked(event)
+
+            # Strictly enforce capacity bound: evict oldest if capacity exceeded
+            if len(self._events) > self._max_events:
+                self._evict_oldest_locked()
+                self._capacity_drop_timestamps.append(clock_ns)
+                self._cumulative_capacity_dropped += 1
 
             self._last_event_monotonic_ns = event.monotonic_ns
             self._last_event_utc = event.timestamp_utc
@@ -114,18 +150,27 @@ class RootSlidingWindow:
 
     def _prune_expired_locked(self, now_monotonic_ns: int) -> int:
         evicted = 0
-        while self._events:
-            oldest = self._events[0]
-            if (now_monotonic_ns - oldest.monotonic_ns) > self._window_duration_ns:
-                self._evict_oldest_locked()
-                evicted += 1
-            else:
-                break
+        cutoff_ns = now_monotonic_ns - self._window_duration_ns
+
+        # Events are sorted chronologically: self._events[0] is oldest
+        while self._events and self._events[0].monotonic_ns < cutoff_ns:
+            self._evict_oldest_locked()
+            evicted += 1
+
+        # Expire old capacity drop records so degradation recovers
+        while (
+            self._capacity_drop_timestamps
+            and self._capacity_drop_timestamps[0] < cutoff_ns
+        ):
+            self._capacity_drop_timestamps.popleft()
+
         return evicted
 
     def _evict_oldest_locked(self) -> None:
-        evicted_event = self._events.popleft()
-        self._ordering_meta.popleft()
+        if not self._events:
+            return
+        evicted_event = self._events.pop(0)
+        self._ordering_meta.pop(0)
         self._exclude_event_locked(evicted_event)
 
     def _include_event_locked(self, event: FileEvent) -> None:
@@ -138,7 +183,11 @@ class RootSlidingWindow:
                 self._deleted_count += 1
             case EventType.RENAMED:
                 self._renamed_count += 1
-                if event.old_path and event.new_path:
+                if (
+                    event.old_path
+                    and event.new_path
+                    and event.old_path != event.new_path
+                ):
                     self._rename_pairs_count += 1
 
         if event.is_directory:
@@ -164,7 +213,11 @@ class RootSlidingWindow:
                 self._deleted_count = max(0, self._deleted_count - 1)
             case EventType.RENAMED:
                 self._renamed_count = max(0, self._renamed_count - 1)
-                if event.old_path and event.new_path:
+                if (
+                    event.old_path
+                    and event.new_path
+                    and event.old_path != event.new_path
+                ):
                     self._rename_pairs_count = max(0, self._rename_pairs_count - 1)
 
         if event.is_directory:
@@ -235,7 +288,9 @@ class RootSlidingWindow:
             self._path_counts.clear()
             self._ext_counts.clear()
             self._dir_counts.clear()
-            self._capacity_dropped_events = 0
+            self._capacity_drop_timestamps.clear()
+            self._cumulative_capacity_dropped = 0
+            self._expired_retrograde_drops = 0
             self._last_event_monotonic_ns = None
             self._last_event_utc = None
 
@@ -269,6 +324,9 @@ class SlidingWindowCorrelator:
 
         self._windows: dict[str, RootSlidingWindow] = {}
         self._last_activity_monotonic: dict[str, int] = {}
+        # Explicit telemetry loss tracking for forcefully evicted roots
+        self._evicted_roots_loss: dict[str, int] = {}
+        self._total_evicted_roots_count: int = 0
         self._lock = threading.RLock()
 
     @property
@@ -279,6 +337,11 @@ class SlidingWindowCorrelator:
     def active_root_count(self) -> int:
         with self._lock:
             return len(self._windows)
+
+    @property
+    def total_evicted_roots_count(self) -> int:
+        with self._lock:
+            return self._total_evicted_roots_count
 
     def add_event(
         self,
@@ -295,11 +358,19 @@ class SlidingWindowCorrelator:
         with self._lock:
             if root_id not in self._windows:
                 if len(self._windows) >= self._max_active_roots:
-                    # Prune the oldest idle root to stay within bounded capacity
+                    # Enforce bounded capacity and record explicit telemetry loss
                     oldest_idle_root = min(
                         self._last_activity_monotonic.keys(),
                         key=lambda r: self._last_activity_monotonic[r],
                     )
+                    logger.warning(
+                        "Active root capacity (%d) reached. Evicting oldest idle "
+                        "root '%s'. Telemetry loss occurred.",
+                        self._max_active_roots,
+                        oldest_idle_root,
+                    )
+                    self._evicted_roots_loss[oldest_idle_root] = clock_ns
+                    self._total_evicted_roots_count += 1
                     self.remove_root(oldest_idle_root)
 
                 self._windows[root_id] = RootSlidingWindow(
@@ -342,7 +413,6 @@ class SlidingWindowCorrelator:
             stats = window.get_aggregate_stats(clock_ns)
 
             now_utc = datetime.now(UTC)
-            # Calculate time range from events or fallback to current clock
             if events:
                 start_utc = events[0].timestamp_utc
                 end_utc = events[-1].timestamp_utc
@@ -350,16 +420,27 @@ class SlidingWindowCorrelator:
                 start_utc = now_utc
                 end_utc = now_utc
 
-            # Propagate capacity drop degradation if window dropped events
             degraded = is_telemetry_degraded
             deg_reason = degradation_reason
-            if window.capacity_dropped_events > 0:
+
+            # Capacity degradation recovers automatically when active drops reach 0
+            if window.active_capacity_dropped_events > 0:
                 degraded = True
-                capacity_msg = (
-                    f"sliding_window_capacity_dropped:{window.capacity_dropped_events}"
-                )
+                drops = window.active_capacity_dropped_events
+                capacity_msg = f"sliding_window_capacity_dropped:{drops}"
                 deg_reason = (
                     f"{deg_reason}; {capacity_msg}" if deg_reason else capacity_msg
+                )
+
+            # Check if this root was previously evicted due to root capacity limit
+            if root_id in self._evicted_roots_loss:
+                degraded = True
+                eviction_msg = (
+                    f"root_previously_evicted_due_to_capacity_limit:"
+                    f"{self._evicted_roots_loss[root_id]}"
+                )
+                deg_reason = (
+                    f"{deg_reason}; {eviction_msg}" if deg_reason else eviction_msg
                 )
 
             return DetectionContext(
@@ -420,9 +501,11 @@ class SlidingWindowCorrelator:
             return len(stale)
 
     def clear(self) -> None:
-        """Clear all active root windows and activity tracking."""
+        """Clear all active root windows, activity tracking, and eviction history."""
         with self._lock:
             for window in self._windows.values():
                 window.clear()
             self._windows.clear()
             self._last_activity_monotonic.clear()
+            self._evicted_roots_loss.clear()
+            self._total_evicted_roots_count = 0

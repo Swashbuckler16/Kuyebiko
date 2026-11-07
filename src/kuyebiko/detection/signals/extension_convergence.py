@@ -42,13 +42,26 @@ class ExtensionConvergenceSignalEvaluator(BaseSignalEvaluator):
         self._min_renames = value
 
     def evaluate(self, context: DetectionContext) -> SignalResult:
-        if len(context.events) < self.min_events:
+        total_events = len(context.events)
+        if total_events < self.min_events:
             return self._create_result(
                 triggered=False,
                 observed_metric=0.0,
                 explanation=(
-                    f"Insufficient events ({len(context.events)}) for extension "
+                    f"Insufficient events ({total_events}) for extension "
                     f"convergence evaluation (min required: {self.min_events})"
+                ),
+                severity_score=0.0,
+            )
+
+        # O(1) Pre-screening: check renamed count in stats
+        if context.stats.renamed_count < self._min_renames:
+            return self._create_result(
+                triggered=False,
+                observed_metric=float(context.stats.renamed_count),
+                explanation=(
+                    f"Total renames ({context.stats.renamed_count}) below "
+                    f"minimum threshold ({self._min_renames})"
                 ),
                 severity_score=0.0,
             )
@@ -84,6 +97,10 @@ class ExtensionConvergenceSignalEvaluator(BaseSignalEvaluator):
                     f"(min required: {self._min_renames})"
                 ),
                 severity_score=0.0,
+                metadata={
+                    "convergence_ratio": 0.0,
+                    "total_extension_mutations": total_changes,
+                },
             )
 
         distinct_original_exts = len(old_extensions)

@@ -37,13 +37,41 @@ class BurstWriteSignalEvaluator(BaseSignalEvaluator):
         self._rate_threshold = value
 
     def evaluate(self, context: DetectionContext) -> SignalResult:
-        if len(context.events) < self.min_events:
+        total_events = len(context.events)
+        if total_events < self.min_events:
             return self._create_result(
                 triggered=False,
                 observed_metric=0.0,
                 explanation=(
-                    f"Insufficient events ({len(context.events)}) for burst "
+                    f"Insufficient events ({total_events}) for burst "
                     f"evaluation (min required: {self.min_events})"
+                ),
+                severity_score=0.0,
+            )
+
+        # O(1) Pre-screening: check total write operations and unique paths in window
+        total_potential_writes = (
+            context.stats.modified_count + context.stats.created_count
+        )
+        if total_potential_writes < self.threshold:
+            return self._create_result(
+                triggered=False,
+                observed_metric=float(total_potential_writes),
+                explanation=(
+                    f"Total write operations ({total_potential_writes}) below "
+                    f"threshold ({self.threshold:.0f})"
+                ),
+                severity_score=0.0,
+            )
+
+        if len(context.stats.unique_relative_paths) < self.threshold:
+            u_paths = len(context.stats.unique_relative_paths)
+            return self._create_result(
+                triggered=False,
+                observed_metric=float(u_paths),
+                explanation=(
+                    f"Unique paths in window ({u_paths}) "
+                    f"below threshold ({self.threshold:.0f})"
                 ),
                 severity_score=0.0,
             )

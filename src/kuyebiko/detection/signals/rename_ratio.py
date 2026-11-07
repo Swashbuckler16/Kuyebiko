@@ -49,12 +49,44 @@ class RenameRatioSignalEvaluator(BaseSignalEvaluator):
                 severity_score=0.0,
             )
 
-        rename_events = [
-            e
-            for e in context.events
-            if e.event_type == EventType.RENAMED and e.old_path and e.new_path
-        ]
-        rename_count = len(rename_events)
+        # O(1) Pre-screening using precomputed window statistics
+        if context.stats.renamed_count < self._min_renames:
+            return self._create_result(
+                triggered=False,
+                observed_metric=round(context.stats.renamed_count / total_events, 4),
+                explanation=(
+                    f"Rename count ({context.stats.renamed_count}) below minimum "
+                    f"threshold ({self._min_renames})"
+                ),
+                severity_score=0.0,
+            )
+
+        if (context.stats.renamed_count / total_events) < self.threshold:
+            return self._create_result(
+                triggered=False,
+                observed_metric=round(context.stats.renamed_count / total_events, 4),
+                explanation=(
+                    f"Rename ratio ({context.stats.renamed_count / total_events:.1%}) "
+                    f"below threshold ({self.threshold:.1%})"
+                ),
+                severity_score=0.0,
+            )
+
+        # Independently verify that each rename represents a confirmed, distinct pair
+        verified_rename_events = []
+        for e in context.events:
+            if e.event_type != EventType.RENAMED or e.is_directory:
+                continue
+            if not e.old_path or not e.new_path:
+                continue
+            # Independently verify old_path and new_path represent distinct locations
+            norm_old = e.old_path.strip().replace("\\", "/")
+            norm_new = e.new_path.strip().replace("\\", "/")
+            if norm_old == norm_new:
+                continue
+            verified_rename_events.append(e)
+
+        rename_count = len(verified_rename_events)
         rename_ratio = rename_count / total_events
 
         triggered = rename_ratio >= self.threshold and rename_count >= self._min_renames
@@ -67,12 +99,12 @@ class RenameRatioSignalEvaluator(BaseSignalEvaluator):
             count_factor = min(1.0, rename_count / max(10, self._min_renames * 2))
             severity = min(1.0, 0.5 + 0.3 * ratio_factor + 0.2 * count_factor)
 
-        evidence_ids = [e.event_id for e in rename_events]
+        evidence_ids = [e.event_id for e in verified_rename_events]
 
         if triggered:
             explanation = (
                 f"Abnormal rename ratio detected: {rename_count}/{total_events} "
-                f"operations ({rename_ratio:.1%}) are file renames "
+                f"operations ({rename_ratio:.1%}) are verified rename pairs "
                 f"(threshold: {self.threshold:.1%}, min renames: {self._min_renames})"
             )
         else:
@@ -89,6 +121,7 @@ class RenameRatioSignalEvaluator(BaseSignalEvaluator):
             evidence_event_ids=evidence_ids if triggered else [],
             metadata={
                 "rename_count": rename_count,
+                "verified_rename_pairs_count": rename_count,
                 "total_events": total_events,
                 "rename_ratio": round(rename_ratio, 4),
                 "threshold_ratio": self.threshold,

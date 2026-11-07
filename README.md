@@ -325,11 +325,11 @@ Benchmarking was conducted on a reference 64-bit Windows 11 host (AMD64, CPython
 
 | Workload Scenario | Event Volume & Roots | Throughput | Avg Latency | P95 Latency | Peak Heap |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Small Load** | 100 events, 1 root | **1,924.7 events/sec** | **0.52 ms** | **1.40 ms** | **0.08 MB** |
-| **Medium Load** | 1,000 events, 1 root | **326.7 events/sec** | **3.06 ms** | **6.37 ms** | **0.28 MB** |
-| **High Load** | 10,000 events, 1 root | **34.7 events/sec** | **28.82 ms** | **48.92 ms** | **2.12 MB** |
-| **Concurrent Multi-Root** | 4,000 events, 4 roots | **275.4 events/sec** | **3.63 ms** | **6.34 ms** | **0.86 MB** |
-| **High-Volume Multi-Root** | 10,000 events, 5 roots | **127.4 events/sec** | **7.85 ms** | **16.59 ms** | **2.05 MB** |
+| **Small Load** | 100 events, 1 root | **2,118.0 events/sec** | **0.47 ms** | **0.87 ms** | **0.08 MB** |
+| **Medium Load** | 1,000 events, 1 root | **371.5 events/sec** | **2.69 ms** | **5.02 ms** | **0.29 MB** |
+| **High Load** | 10,000 events, 1 root | **48.1 events/sec** | **20.80 ms** | **32.77 ms** | **2.16 MB** |
+| **Concurrent Multi-Root** | 4,000 events, 4 roots | **386.3 events/sec** | **2.59 ms** | **4.85 ms** | **0.86 MB** |
+| **High-Volume Multi-Root** | 10,000 events, 5 roots | **180.9 events/sec** | **5.53 ms** | **10.81 ms** | **2.04 MB** |
 
 ---
 

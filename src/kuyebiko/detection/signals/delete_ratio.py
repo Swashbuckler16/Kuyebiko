@@ -49,6 +49,29 @@ class DeleteRatioSignalEvaluator(BaseSignalEvaluator):
                 severity_score=0.0,
             )
 
+        # O(1) Pre-screening: check total deleted count in stats
+        if context.stats.deleted_count < self._min_deletions:
+            return self._create_result(
+                triggered=False,
+                observed_metric=round(context.stats.deleted_count / total_events, 4),
+                explanation=(
+                    f"Total deletions ({context.stats.deleted_count}) below "
+                    f"minimum threshold ({self._min_deletions})"
+                ),
+                severity_score=0.0,
+            )
+
+        if (context.stats.deleted_count / total_events) < self.threshold:
+            return self._create_result(
+                triggered=False,
+                observed_metric=round(context.stats.deleted_count / total_events, 4),
+                explanation=(
+                    f"Delete ratio ({context.stats.deleted_count / total_events:.1%}) "
+                    f"below threshold ({self.threshold:.1%})"
+                ),
+                severity_score=0.0,
+            )
+
         file_delete_events = [
             e
             for e in context.events

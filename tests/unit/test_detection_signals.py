@@ -5,7 +5,6 @@ from datetime import UTC, datetime
 from kuyebiko.detection.context import DetectionContext
 from kuyebiko.detection.models import (
     SignalFamily,
-    WindowAggregateStats,
 )
 from kuyebiko.detection.signals.burst_write import BurstWriteSignalEvaluator
 from kuyebiko.detection.signals.delete_ratio import DeleteRatioSignalEvaluator
@@ -16,6 +15,7 @@ from kuyebiko.detection.signals.extension_convergence import (
     ExtensionConvergenceSignalEvaluator,
 )
 from kuyebiko.detection.signals.rename_ratio import RenameRatioSignalEvaluator
+from kuyebiko.detection.window import RootSlidingWindow
 from kuyebiko.models.events import EventSource, EventType, FileEvent
 
 
@@ -23,11 +23,13 @@ def _make_context(
     events: list[FileEvent],
     window_duration_seconds: float = 10.0,
 ) -> DetectionContext:
-    now = datetime.now(UTC)
-    stats = WindowAggregateStats(
-        total_events=len(events),
-        window_duration_seconds=window_duration_seconds,
+    window = RootSlidingWindow(
+        root_id="root-1", window_duration_seconds=window_duration_seconds
     )
+    for e in events:
+        window.add_event(e)
+    stats = window.get_aggregate_stats()
+    now = datetime.now(UTC)
     return DetectionContext(
         root_id="root-1",
         events=events,
@@ -79,7 +81,10 @@ def test_burst_write_single_file_repeated_no_trigger():
     res = evaluator.evaluate(_make_context(events))
     assert res.triggered is False
     assert res.observed_metric == 1.0  # only 1 unique file
-    assert "within normal limits" in res.explanation
+    assert (
+        "below threshold" in res.explanation
+        or "within normal limits" in res.explanation
+    )
 
 
 def test_burst_write_positive_trigger():
@@ -308,3 +313,58 @@ def test_extension_convergence_negative_diverse_targets():
     res = evaluator.evaluate(_make_context(events))
     assert res.triggered is False
     assert res.metadata["convergence_ratio"] == 0.25
+
+
+def test_rename_ratio_rejects_identical_paths_and_directory_renames():
+    evaluator = RenameRatioSignalEvaluator(threshold=0.50, min_renames=3, min_events=5)
+    # 5 rename events, but all have old_path == new_path or is_directory=True
+    events = [
+        FileEvent(
+            event_id="r1",
+            root_id="root-1",
+            file_path="same.txt",
+            event_type=EventType.RENAMED,
+            old_path="same.txt",
+            new_path="same.txt",
+            monotonic_ns=1_000,
+            source=EventSource.WINDOWS_WATCHER,
+        ),
+        FileEvent(
+            event_id="r2",
+            root_id="root-1",
+            file_path="subfolder",
+            event_type=EventType.RENAMED,
+            old_path="oldfolder",
+            new_path="subfolder",
+            is_directory=True,
+            monotonic_ns=1_000,
+            source=EventSource.WINDOWS_WATCHER,
+        ),
+        FileEvent(
+            event_id="r3",
+            root_id="root-1",
+            file_path="file3.txt",
+            event_type=EventType.MODIFIED,
+            monotonic_ns=1_000,
+            source=EventSource.WINDOWS_WATCHER,
+        ),
+        FileEvent(
+            event_id="r4",
+            root_id="root-1",
+            file_path="file4.txt",
+            event_type=EventType.MODIFIED,
+            monotonic_ns=1_000,
+            source=EventSource.WINDOWS_WATCHER,
+        ),
+        FileEvent(
+            event_id="r5",
+            root_id="root-1",
+            file_path="file5.txt",
+            event_type=EventType.MODIFIED,
+            monotonic_ns=1_000,
+            source=EventSource.WINDOWS_WATCHER,
+        ),
+    ]
+
+    res = evaluator.evaluate(_make_context(events))
+    assert res.triggered is False

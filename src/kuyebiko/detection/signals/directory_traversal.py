@@ -39,6 +39,18 @@ class DirectoryTraversalSignalEvaluator(BaseSignalEvaluator):
                 severity_score=0.0,
             )
 
+        # O(1) Pre-screening: check unique directories in window stats
+        if len(context.stats.unique_directories) < self.threshold:
+            return self._create_result(
+                triggered=False,
+                observed_metric=float(len(context.stats.unique_directories)),
+                explanation=(
+                    f"Unique directories ({len(context.stats.unique_directories)}) "
+                    f"below threshold ({self.threshold:.0f})"
+                ),
+                severity_score=0.0,
+            )
+
         dir_counts: Counter[str] = Counter()
         for event in context.events:
             dirname = posixpath.dirname(event.file_path)

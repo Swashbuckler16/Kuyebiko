@@ -25,9 +25,9 @@ def _make_event(
         "root_id": root_id,
         "file_path": file_path,
         "event_type": event_type,
-        "monotonic_ns": monotonic_ns
-        if monotonic_ns is not None
-        else time.monotonic_ns(),
+        "monotonic_ns": (
+            monotonic_ns if monotonic_ns is not None else time.monotonic_ns()
+        ),
         "source": EventSource.WINDOWS_WATCHER,
         "is_directory": is_directory,
     }
@@ -51,7 +51,6 @@ def test_root_sliding_window_validation():
 def test_root_sliding_window_normal_arrival_and_stats():
     window = RootSlidingWindow(root_id="root-1", window_duration_seconds=10.0)
 
-    # Add 1 created, 2 modified, 1 deleted, 1 renamed
     e1 = _make_event(
         file_path="a.txt",
         event_type=EventType.CREATED,
@@ -103,17 +102,14 @@ def test_root_sliding_window_normal_arrival_and_stats():
 
 
 def test_root_sliding_window_expiration():
-    # 5-second window
     window = RootSlidingWindow(root_id="root-1", window_duration_seconds=5.0)
 
-    # e1 at t=1s
     e1 = _make_event(
         file_path="a.txt",
         event_type=EventType.CREATED,
         monotonic_ns=1_000_000_000,
         event_id="e1",
     )
-    # e2 at t=4s
     e2 = _make_event(
         file_path="b.txt",
         event_type=EventType.MODIFIED,
@@ -124,11 +120,9 @@ def test_root_sliding_window_expiration():
     window.add_event(e1)
     window.add_event(e2)
 
-    # At t=5s, both are within 5s
     stats_t5 = window.get_aggregate_stats(now_monotonic_ns=5_000_000_000)
     assert stats_t5.total_events == 2
 
-    # At t=7s, e1 (at 1s) is > 5s old (7 - 1 = 6s > 5s), so it should expire
     stats_t7 = window.get_aggregate_stats(now_monotonic_ns=7_000_000_000)
     assert stats_t7.total_events == 1
     assert stats_t7.created_count == 0
@@ -136,8 +130,127 @@ def test_root_sliding_window_expiration():
     assert stats_t7.unique_relative_paths == ["b.txt"]
 
 
+def test_out_of_order_event_inserted_chronologically_and_expires_correctly():
+    """An out-of-order event expires at its exact due time."""
+    # 10-second window
+    window = RootSlidingWindow(root_id="root-1", window_duration_seconds=10.0)
+
+    # Event 1 at t=5s
+    e1 = _make_event(
+        file_path="mid.txt",
+        event_type=EventType.MODIFIED,
+        monotonic_ns=5_000_000_000,
+        event_id="e1",
+    )
+    # Event 2 at t=10s
+    e2 = _make_event(
+        file_path="latest.txt",
+        event_type=EventType.MODIFIED,
+        monotonic_ns=10_000_000_000,
+        event_id="e2",
+    )
+    window.add_event(e1)
+    window.add_event(e2)
+
+    # Event 3 arrives out-of-order with timestamp t=3s (older than e1 and e2)
+    e3 = _make_event(
+        file_path="earliest.txt",
+        event_type=EventType.MODIFIED,
+        monotonic_ns=3_000_000_000,
+        event_id="e3",
+    )
+    window.add_event(e3, now_monotonic_ns=10_000_000_000)
+
+    # Window should order them chronologically: [e3 (3s), e1 (5s), e2 (10s)]
+    events = window.get_events()
+    assert len(events) == 3
+    assert events[0].event_id == "e3"
+    assert events[1].event_id == "e1"
+    assert events[2].event_id == "e2"
+
+    # At t=14s (cutoff is 14 - 10 = 4s):
+    # e3 (at 3s) MUST be pruned, but e1 (5s) and e2 (10s) must remain!
+    stats = window.get_aggregate_stats(now_monotonic_ns=14_000_000_000)
+    assert stats.total_events == 2
+    remaining_ids = [e.event_id for e in window.get_events()]
+    assert "e3" not in remaining_ids
+    assert "e1" in remaining_ids
+    assert "e2" in remaining_ids
+
+
+def test_capacity_drop_recovers_after_window_expiration():
+    """Capacity degradation recovers automatically once the active window passes."""
+    correlator = SlidingWindowCorrelator(
+        window_duration_seconds=10.0, max_events_per_root=10
+    )
+
+    base_ns = 1_000_000_000
+    # Add 12 events to trigger 2 capacity drops at t=1s
+    for i in range(12):
+        correlator.add_event(
+            _make_event(
+                root_id="root-rec",
+                file_path=f"file_{i}.txt",
+                monotonic_ns=base_ns + i * 1_000,
+            ),
+            now_monotonic_ns=base_ns + i * 1_000,
+        )
+
+    # While events and drops are within active window horizon, root is degraded
+    ctx_active = correlator.get_context(
+        "root-rec", now_monotonic_ns=base_ns + 5_000_000_000
+    )
+    assert ctx_active is not None
+    assert ctx_active.is_telemetry_degraded is True
+    assert "sliding_window_capacity_dropped:2" in ctx_active.degradation_reason
+
+    # 15 seconds later (window is 10s), the capacity drops and events have expired!
+    ctx_recovered = correlator.get_context(
+        "root-rec", now_monotonic_ns=base_ns + 15_000_000_000
+    )
+    assert ctx_recovered is not None
+    # Telemetry degradation has recovered!
+    assert ctx_recovered.is_telemetry_degraded is False
+    assert ctx_recovered.degradation_reason is None
+
+
+def test_active_root_eviction_propagates_telemetry_loss():
+    """When an active root is evicted, telemetry loss is explicitly recorded."""
+    correlator = SlidingWindowCorrelator(
+        window_duration_seconds=10.0, max_active_roots=2
+    )
+
+    t1 = 1_000_000_000
+    t2 = 2_000_000_000
+    t3 = 3_000_000_000
+
+    correlator.add_event(
+        _make_event(root_id="r1", monotonic_ns=t1, event_id="e1"), now_monotonic_ns=t1
+    )
+    correlator.add_event(
+        _make_event(root_id="r2", monotonic_ns=t2, event_id="e2"), now_monotonic_ns=t2
+    )
+    assert correlator.active_root_count == 2
+
+    # Adding r3 forces eviction of the oldest idle root (r1)
+    correlator.add_event(
+        _make_event(root_id="r3", monotonic_ns=t3, event_id="e3"), now_monotonic_ns=t3
+    )
+    assert correlator.active_root_count == 2
+    assert correlator.total_evicted_roots_count == 1
+
+    # Now if r1 becomes active again, its context explicitly reflects the telemetry loss
+    correlator.add_event(
+        _make_event(root_id="r1", monotonic_ns=t3 + 1_000_000_000, event_id="e1_new"),
+        now_monotonic_ns=t3 + 1_000_000_000,
+    )
+    ctx_r1 = correlator.get_context("r1", now_monotonic_ns=t3 + 1_000_000_000)
+    assert ctx_r1 is not None
+    assert ctx_r1.is_telemetry_degraded is True
+    assert "root_previously_evicted_due_to_capacity_limit" in ctx_r1.degradation_reason
+
+
 def test_root_sliding_window_max_capacity_bounded():
-    # Capacity = 10
     window = RootSlidingWindow(
         root_id="root-1", window_duration_seconds=60.0, max_events=10
     )
@@ -152,9 +265,9 @@ def test_root_sliding_window_max_capacity_bounded():
 
     assert len(window.get_events()) == 10
     assert window.capacity_dropped_events == 5
+    assert window.cumulative_capacity_dropped_events == 5
     stats = window.get_aggregate_stats()
     assert stats.total_events == 10
-    # Earliest 5 evicted
     assert "file_0.txt" not in stats.unique_relative_paths
     assert "file_14.txt" in stats.unique_relative_paths
 
@@ -171,7 +284,6 @@ def test_sliding_window_correlator_multi_root_isolation():
         window_duration_seconds=10.0, max_events_per_root=100
     )
 
-    # Add events to root-A and root-B
     ea = _make_event(root_id="root-A", file_path="docA.txt", event_id="ea1")
     eb = _make_event(root_id="root-B", file_path="docB.txt", event_id="eb1")
 
@@ -189,59 +301,6 @@ def test_sliding_window_correlator_multi_root_isolation():
     assert ctx_a.events[0].file_path == "docA.txt"
     assert len(ctx_b.events) == 1
     assert ctx_b.events[0].file_path == "docB.txt"
-
-
-def test_sliding_window_correlator_degradation_propagation():
-    correlator = SlidingWindowCorrelator(
-        window_duration_seconds=10.0, max_events_per_root=10
-    )
-
-    # Force capacity drop
-    for i in range(12):
-        correlator.add_event(_make_event(root_id="root-1", file_path=f"f_{i}.txt"))
-
-    ctx = correlator.get_context(
-        "root-1",
-        is_telemetry_degraded=False,
-    )
-    assert ctx is not None
-    assert ctx.is_telemetry_degraded is True
-    assert "sliding_window_capacity_dropped:2" in ctx.degradation_reason
-
-
-def test_sliding_window_correlator_remove_and_prune_stale_roots():
-    correlator = SlidingWindowCorrelator(
-        window_duration_seconds=10.0, max_active_roots=2
-    )
-
-    correlator.add_event(
-        _make_event(root_id="r1", monotonic_ns=1_000_000_000, event_id="e1")
-    )
-    correlator.add_event(
-        _make_event(root_id="r2", monotonic_ns=2_000_000_000, event_id="e2")
-    )
-    assert correlator.active_root_count == 2
-
-    # Adding r3 when max_active_roots is 2 evicts the oldest idle root (r1)
-    correlator.add_event(
-        _make_event(root_id="r3", monotonic_ns=3_000_000_000, event_id="e3")
-    )
-    assert correlator.active_root_count == 2
-    assert correlator.get_context("r1") is None
-    assert correlator.get_context("r2") is not None
-    assert correlator.get_context("r3") is not None
-
-    # Explicit removal
-    removed = correlator.remove_root("r2")
-    assert removed is True
-    assert correlator.active_root_count == 1
-
-    # Prune stale roots
-    pruned = correlator.prune_stale_roots(
-        max_idle_seconds=10.0, now_monotonic_ns=20_000_000_000
-    )
-    assert pruned == 1
-    assert correlator.active_root_count == 0
 
 
 def test_sliding_window_correlator_empty_and_clear():

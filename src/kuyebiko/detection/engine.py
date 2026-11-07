@@ -28,7 +28,7 @@ from kuyebiko.detection.signals.extension_convergence import (
 )
 from kuyebiko.detection.signals.rename_ratio import RenameRatioSignalEvaluator
 from kuyebiko.detection.window import SlidingWindowCorrelator
-from kuyebiko.models.events import FileEvent, TelemetryQuality
+from kuyebiko.models.events import EventType, FileEvent, TelemetryQuality
 from kuyebiko.processing.contracts import EventConsumer
 from kuyebiko.processing.ordering import EventOrderingMetadata
 
@@ -44,6 +44,7 @@ class DetectionEngine(EventConsumer):
         registry: SignalRegistry | None = None,
         auto_register_default_signals: bool = True,
         detection_family_threshold: int = 2,
+        eval_interval_events: int = 1,
     ) -> None:
         """Initialize detection engine with correlator, registry, and policies.
 
@@ -53,11 +54,16 @@ class DetectionEngine(EventConsumer):
             auto_register_default_signals: Whether to register foundational signals.
             detection_family_threshold: Minimum triggered signal families required
                 for confirmed DETECTION (default 2). 1 family yields SUSPICIOUS.
+            eval_interval_events: Evaluation throttling interval (default 1).
         """
         if detection_family_threshold < 1:
             raise ValueError(
                 "detection_family_threshold must be at least 1, "
                 f"got {detection_family_threshold}"
+            )
+        if eval_interval_events < 1:
+            raise ValueError(
+                f"eval_interval_events must be at least 1, got {eval_interval_events}"
             )
 
         self._correlator = (
@@ -65,11 +71,13 @@ class DetectionEngine(EventConsumer):
         )
         self._registry = registry if registry is not None else SignalRegistry()
         self._detection_family_threshold = detection_family_threshold
+        self._eval_interval_events = eval_interval_events
 
         self._listeners: list[Callable[[DetectionResult], None]] = []
         self._lock = threading.RLock()
         self._latest_results: dict[str, DetectionResult] = {}
         self._telemetry_degraded_by_root: dict[str, tuple[bool, str | None, bool]] = {}
+        self._events_since_eval: dict[str, int] = {}
 
         if auto_register_default_signals:
             self._register_foundational_signals()
@@ -81,6 +89,16 @@ class DetectionEngine(EventConsumer):
     @property
     def registry(self) -> SignalRegistry:
         return self._registry
+
+    @property
+    def eval_interval_events(self) -> int:
+        return self._eval_interval_events
+
+    @eval_interval_events.setter
+    def eval_interval_events(self, value: int) -> None:
+        if value < 1:
+            raise ValueError(f"eval_interval_events must be at least 1, got {value}")
+        self._eval_interval_events = value
 
     def _register_foundational_signals(self) -> None:
         """Register the five foundational ransomware behavioural signals."""
@@ -145,7 +163,6 @@ class DetectionEngine(EventConsumer):
             now_monotonic_ns=clock_ns,
         )
 
-        # Update root degradation if event itself carries degraded quality
         if event.quality == TelemetryQuality.DEGRADED:
             self.set_root_telemetry_status(
                 root_id=root_id,
@@ -153,7 +170,22 @@ class DetectionEngine(EventConsumer):
                 reason="event_telemetry_quality_degraded",
             )
 
-        return self.evaluate_root(root_id, now_monotonic_ns=clock_ns)
+        with self._lock:
+            count = self._events_since_eval.get(root_id, 0) + 1
+            self._events_since_eval[root_id] = count
+
+            # Evaluate if interval reached or event is a high-priority mutation
+            should_eval = count >= self._eval_interval_events or event.event_type in (
+                EventType.RENAMED,
+                EventType.DELETED,
+            )
+            if should_eval:
+                self._events_since_eval[root_id] = 0
+
+        if should_eval:
+            return self.evaluate_root(root_id, now_monotonic_ns=clock_ns)
+
+        return self.get_latest_result(root_id)
 
     def evaluate_root(
         self,
@@ -182,7 +214,6 @@ class DetectionEngine(EventConsumer):
         now_utc = datetime.now(UTC)
 
         if context is None:
-            # Root has no active events or window
             res = DetectionResult(
                 evaluation_id=str(uuid4()),
                 root_id=root_id,
@@ -218,11 +249,25 @@ class DetectionEngine(EventConsumer):
 
         triggered_families = sorted(list(triggered_families_set), key=lambda f: f.value)
 
-        # Determine overall evaluation outcome
+        # Robust outcome determination: differentiate benign batch ops from ransomware
         if errors:
             outcome = DetectionOutcome.EVALUATION_ERROR
-        elif len(triggered_families) >= self._detection_family_threshold:
+        elif len(triggered_families) >= 3:
             outcome = DetectionOutcome.DETECTION
+        elif len(triggered_families) >= self._detection_family_threshold:
+            # Multi-family correlation requires mutation/transformation confirmation
+            has_transformation = (
+                SignalFamily.FILE_TRANSFORMATION in triggered_families_set
+            )
+            has_rename_burst = (
+                "FS_BURST_WRITE" in triggered_signals
+                and "FS_RENAME_RATIO" in triggered_signals
+            )
+            if has_transformation or has_rename_burst:
+                outcome = DetectionOutcome.DETECTION
+            else:
+                # E.g. Burst Write + Traversal during build, or Delete + Traversal
+                outcome = DetectionOutcome.SUSPICIOUS_ACTIVITY
         elif len(triggered_signals) > 0:
             outcome = DetectionOutcome.SUSPICIOUS_ACTIVITY
         elif context.is_telemetry_degraded:
@@ -283,3 +328,4 @@ class DetectionEngine(EventConsumer):
             self._correlator.clear()
             self._latest_results.clear()
             self._telemetry_degraded_by_root.clear()
+            self._events_since_eval.clear()

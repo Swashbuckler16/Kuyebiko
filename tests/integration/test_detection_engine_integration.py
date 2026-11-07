@@ -108,14 +108,16 @@ def test_scenario_b_suspicious_burst_multi_family():
             )
         )
 
-    for i in range(8):
+    exts = ["docx", "pdf", "xlsx", "jpg", "png", "zip"]
+    for i in range(12):
         d = dirs[i % len(dirs)]
+        orig_ext = exts[i % len(exts)]
         events.append(
             _event(
                 root_id="root-attack",
                 file_path=f"{d}/doc_{i}.locked",
                 event_type=EventType.RENAMED,
-                old_path=f"{d}/doc_{i}.docx",
+                old_path=f"{d}/doc_{i}.{orig_ext}",
                 new_path=f"{d}/doc_{i}.locked",
                 monotonic_ns=base_time + 1_000_000_000 + i * 50_000_000,
                 event_id=f"rename_{i}",
@@ -133,6 +135,36 @@ def test_scenario_b_suspicious_burst_multi_family():
     assert len(last_result.triggered_signal_families) >= 2
     assert SignalFamily.FILESYSTEM_ACTIVITY in last_result.triggered_signal_families
     assert SignalFamily.DIRECTORY_TRAVERSAL in last_result.triggered_signal_families
+
+
+def test_benign_batch_build_classified_as_suspicious_not_detection():
+    """Benign compiler workload (Burst Write + Traversal) does not trigger DETECTION."""
+    engine = DetectionEngine(auto_register_default_signals=True)
+
+    base_time = time.monotonic_ns()
+    # 20 writes across 6 directories (e.g. gcc / cargo build creating object files)
+    dirs = ["bin", "obj", "gen", "lib", "include", "target"]
+    events = [
+        _event(
+            root_id="root-build",
+            file_path=f"{dirs[i % len(dirs)]}/artifact_{i}.o",
+            event_type=EventType.MODIFIED,
+            monotonic_ns=base_time + i * 50_000_000,
+            event_id=f"build_{i}",
+        )
+        for i in range(20)
+    ]
+
+    last_result = None
+    for e in events:
+        last_result = engine.process_event(e)
+
+    assert last_result is not None
+    # Triggers FS_BURST_WRITE and FS_DIRECTORY_TRAVERSAL (2 families)
+    assert "FS_BURST_WRITE" in last_result.triggered_signal_ids
+    assert "FS_DIRECTORY_TRAVERSAL" in last_result.triggered_signal_ids
+    # No renames, deletes, or extension convergence: outcome is SUSPICIOUS_ACTIVITY
+    assert last_result.outcome == DetectionOutcome.SUSPICIOUS_ACTIVITY
 
 
 def test_scenario_c_extension_convergence():
