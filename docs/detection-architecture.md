@@ -125,9 +125,27 @@ Evaluation cycles yield structured `DetectionOutcome` values:
 - **Out-of-Order Worst Case (O(n)):** For rare out-of-order events arriving within the active window horizon, the insertion index is located via O(log n) binary search (`bisect_right`) over the pre-maintained `_timestamps` array, followed by an O(n) element shift to insert the event. This avoids intermediate list allocations while maintaining strictly sorted chronological order.
 - **Retrograde Event Handling:** Events whose timestamps are older than the active window duration (`clock_ns - monotonic_ns > window_duration_ns`) are dropped. Their occurrence is tracked via a timestamped deque (`_retrograde_drop_timestamps`) and immediately degrades `DetectionContext` telemetry (`is_telemetry_degraded = True`, reason: `retrograde_events_dropped:N`).
 
-### 6.2 Degradation & Telemetry Loss Recovery
+### 6.2 Degradation & Telemetry Loss Recovery (Hardened)
 All internal degradation sources feature deterministic, time-bounded recovery policies:
 1. **Window Capacity Drops:** Tracked via `_capacity_drop_timestamps: deque[int]`. Once expired relative to the sliding window duration horizon (`cutoff_ns = now_monotonic_ns - window_duration_ns`), the drop records are evicted and telemetry degradation automatically clears.
 2. **Retrograde Event Drops:** Tracked via `_retrograde_drop_timestamps: deque[int]`. Expired once their drop timestamps fall outside the active window duration horizon.
-3. **Root Eviction Telemetry Loss:** When the correlator reaches capacity (`max_active_roots`), the oldest idle root is evicted and its loss timestamp recorded in `_evicted_roots_loss`. When the evicted root returns, it is initially flagged as degraded until a full, continuous observation window (duration >= `window_duration_seconds`) has been re-established without further active drops, at which point the eviction loss record is removed and normal telemetry status is restored.
+3. **Root Eviction Telemetry Loss:** When the correlator reaches capacity (`max_active_roots`), the oldest idle root is evicted and its loss timestamp recorded in `_evicted_roots_loss`. Recovery requires **active observation continuity evidence** (`len(events) >= 2` spanning the observation window duration, or continuous monitoring since reseen with recent events), a **healthy external watcher** (`is_telemetry_degraded = False`, normal quality, no kernel loss), and **zero active drops** in the window. Elapsed time alone without active events never clears degradation.
+4. **Independent Reason Tracking:** Each degradation source (watcher buffer overflow, driver timeout, window capacity drop, retrograde drop, root eviction loss) is tracked and evaluated independently. Recovering one reason never accidentally clears another.
+
+---
+
+## 7. Rename Correlation Provenance & Detection Integrity
+
+1. **Explicit Correlation Provenance:** `FileEvent` models generated from Windows two-part rename notifications carry explicit provenance (`correlation_provenance = "rename_correlator:<old>-><new>"`). Unpaired or incomplete rename notifications cannot inflate `FS_RENAME_RATIO`.
+2. **Directory Rename Exclusion:** Directory renames (`is_directory = True`) are excluded from file rename pair counts and ratios to prevent administrative folder operations from skewing ransomware detection metrics.
+3. **Incremental Statistics Cross-Checking:** `RootSlidingWindow` incrementally tracks verified `rename_pairs_count`. Evaluators independently verify event-level provenance against `context.stats.rename_pairs_count` and flag any discrepancies (`stats_discrepancy = True`) in detection metadata.
+
+---
+
+## 8. Algorithmic Optimizations & Scaling
+
+1. **Pre-Screening Guards:** All five foundational evaluators execute instantaneous O(1) statistical pre-screening checks using precomputed window aggregates (`stats.rename_pairs_count`, `stats.deleted_count`, `stats.unique_directories`, etc.) before evaluating event lists.
+2. **Homogeneous Workload Fast-Paths:** When all events in a window represent uniform file mutations (e.g. 100% write burst or 100% deletion batch), list comprehensions and set allocations are bypassed in O(1) time using precomputed totals and unique path sets.
+3. **Adaptive Path Sorting:** For window sizes exceeding 200 paths, expensive full string sorting is bypassed in favor of O(n) key retrieval, eliminating CPU bottlenecks during sustained high-event bursts.
+4. **Precomputed Directory Diversity:** `FS_DIRECTORY_TRAVERSAL` evaluates directory branch diversity directly from precomputed window statistics (`stats.unique_directories`), avoiding full-window event iteration.
 

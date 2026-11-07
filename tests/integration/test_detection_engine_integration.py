@@ -45,6 +45,9 @@ def _event(
     if event_type == EventType.RENAMED:
         kwargs["old_path"] = old_path or "old.txt"
         kwargs["new_path"] = new_path or file_path
+        kwargs["correlation_provenance"] = (
+            f"rename_correlator:{kwargs['old_path']}->{kwargs['new_path']}"
+        )
     return FileEvent(**kwargs)
 
 

@@ -72,13 +72,22 @@ class DeleteRatioSignalEvaluator(BaseSignalEvaluator):
                 severity_score=0.0,
             )
 
-        file_delete_events = [
-            e
-            for e in context.events
-            if e.event_type == EventType.DELETED and not e.is_directory
-        ]
-        delete_count = len(file_delete_events)
-        unique_paths = {e.file_path for e in file_delete_events}
+        all_are_file_deletes = (
+            context.stats.deleted_count == total_events
+            and context.stats.directory_operations_count == 0
+        )
+        if all_are_file_deletes:
+            file_delete_events = context.events
+            delete_count = total_events
+            unique_paths = set(context.stats.unique_relative_paths)
+        else:
+            file_delete_events = [
+                e
+                for e in context.events
+                if e.event_type == EventType.DELETED and not e.is_directory
+            ]
+            delete_count = len(file_delete_events)
+            unique_paths = {e.file_path for e in file_delete_events}
         delete_ratio = delete_count / total_events
 
         triggered = (

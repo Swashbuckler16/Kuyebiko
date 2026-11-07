@@ -1,8 +1,5 @@
 """FS_DIRECTORY_TRAVERSAL: Directory Traversal Diversity evaluator."""
 
-import posixpath
-from collections import Counter
-
 from kuyebiko.detection.context import DetectionContext
 from kuyebiko.detection.models import SignalFamily, SignalResult
 from kuyebiko.detection.signals.base import BaseSignalEvaluator
@@ -51,13 +48,7 @@ class DirectoryTraversalSignalEvaluator(BaseSignalEvaluator):
                 severity_score=0.0,
             )
 
-        dir_counts: Counter[str] = Counter()
-        for event in context.events:
-            dirname = posixpath.dirname(event.file_path)
-            clean_dir = dirname if dirname else "<root>"
-            dir_counts[clean_dir] += 1
-
-        unique_dir_count = len(dir_counts)
+        unique_dir_count = len(context.stats.unique_directories)
         triggered = unique_dir_count >= self.threshold
 
         severity = 0.0
@@ -85,7 +76,7 @@ class DirectoryTraversalSignalEvaluator(BaseSignalEvaluator):
                 f"touched (threshold: {self.threshold:.0f} directories)"
             )
 
-        evidence_ids = [e.event_id for e in context.events]
+        evidence_ids = [e.event_id for e in context.events[-50:]] if triggered else []
 
         return self._create_result(
             triggered=triggered,
@@ -95,7 +86,7 @@ class DirectoryTraversalSignalEvaluator(BaseSignalEvaluator):
             evidence_event_ids=evidence_ids if triggered else [],
             metadata={
                 "unique_directories_count": unique_dir_count,
-                "directories_sample": sorted(dir_counts.keys())[:10],
+                "directories_sample": context.stats.unique_directories[:10],
                 "traversal_rate_dirs_sec": round(dirs_per_second, 2),
                 "total_events": total_events,
             },

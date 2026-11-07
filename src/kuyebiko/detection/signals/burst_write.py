@@ -76,16 +76,24 @@ class BurstWriteSignalEvaluator(BaseSignalEvaluator):
                 severity_score=0.0,
             )
 
-        write_events = [
-            e
-            for e in context.events
-            if e.event_type in (EventType.MODIFIED, EventType.CREATED)
-            and not e.is_directory
-        ]
-
-        unique_paths = {e.file_path for e in write_events}
-        unique_count = len(unique_paths)
-        total_writes = len(write_events)
+        all_are_file_writes = (
+            total_potential_writes == total_events
+            and context.stats.directory_operations_count == 0
+        )
+        if all_are_file_writes:
+            write_events = context.events
+            unique_count = len(context.stats.unique_relative_paths)
+            total_writes = total_events
+        else:
+            write_events = [
+                e
+                for e in context.events
+                if e.event_type in (EventType.MODIFIED, EventType.CREATED)
+                and not e.is_directory
+            ]
+            unique_paths = {e.file_path for e in write_events}
+            unique_count = len(unique_paths)
+            total_writes = len(write_events)
 
         # Measure rate using active burst span or fallback to window duration
         if len(write_events) >= 2:

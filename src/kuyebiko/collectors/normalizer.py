@@ -113,6 +113,12 @@ class EventNormalizer:
 
         seq = self._next_sequence()
 
+        provenance = (
+            f"explicit_pair:{event_old}->{event_new}"
+            if event_type == EventType.RENAMED
+            else None
+        )
+
         try:
             return FileEvent(
                 event_id=str(uuid4()),
@@ -127,6 +133,7 @@ class EventNormalizer:
                 source=self._source,
                 sequence_number=seq,
                 quality=quality,
+                correlation_provenance=provenance,
             )
         except Exception as err:
             logger.error("Failed to construct normalized FileEvent: %s", err)
@@ -154,6 +161,9 @@ class EventNormalizer:
                 source=self._source,
                 sequence_number=seq,
                 quality=quality,
+                correlation_provenance=(
+                    f"rename_correlator:{correlated.old_path}->{correlated.new_path}"
+                ),
             )
         except Exception as err:
             logger.error("Failed to construct normalized rename FileEvent: %s", err)

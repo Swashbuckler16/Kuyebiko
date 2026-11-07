@@ -50,32 +50,52 @@ class RenameRatioSignalEvaluator(BaseSignalEvaluator):
             )
 
         # O(1) Pre-screening using precomputed window statistics
-        if context.stats.renamed_count < self._min_renames:
+        if context.stats.rename_pairs_count < self._min_renames:
             return self._create_result(
                 triggered=False,
-                observed_metric=round(context.stats.renamed_count / total_events, 4),
+                observed_metric=round(
+                    context.stats.rename_pairs_count / total_events, 4
+                ),
                 explanation=(
-                    f"Rename count ({context.stats.renamed_count}) below minimum "
+                    f"Correlated rename pairs count "
+                    f"({context.stats.rename_pairs_count}) below minimum "
                     f"threshold ({self._min_renames})"
                 ),
                 severity_score=0.0,
+                metadata={
+                    "total_events": total_events,
+                    "stats_rename_pairs_count": context.stats.rename_pairs_count,
+                    "min_renames": self._min_renames,
+                },
             )
 
-        if (context.stats.renamed_count / total_events) < self.threshold:
+        if (context.stats.rename_pairs_count / total_events) < self.threshold:
             return self._create_result(
                 triggered=False,
-                observed_metric=round(context.stats.renamed_count / total_events, 4),
+                observed_metric=round(
+                    context.stats.rename_pairs_count / total_events, 4
+                ),
                 explanation=(
-                    f"Rename ratio ({context.stats.renamed_count / total_events:.1%}) "
+                    f"Correlated rename ratio "
+                    f"({context.stats.rename_pairs_count / total_events:.1%}) "
                     f"below threshold ({self.threshold:.1%})"
                 ),
                 severity_score=0.0,
+                metadata={
+                    "total_events": total_events,
+                    "stats_rename_pairs_count": context.stats.rename_pairs_count,
+                    "threshold": self.threshold,
+                },
             )
 
-        # Independently verify that each rename represents a confirmed, distinct pair
+        # Independently verify that each rename has explicit correlation provenance,
+        # represents a confirmed distinct file pair, and is not a directory mutation.
         verified_rename_events = []
         for e in context.events:
             if e.event_type != EventType.RENAMED or e.is_directory:
+                continue
+            # Enforce explicit rename correlation provenance
+            if not e.correlation_provenance:
                 continue
             if not e.old_path or not e.new_path:
                 continue
@@ -87,10 +107,11 @@ class RenameRatioSignalEvaluator(BaseSignalEvaluator):
             verified_rename_events.append(e)
 
         rename_count = len(verified_rename_events)
+        stats_pairs = context.stats.rename_pairs_count
+        stats_discrepancy = rename_count != stats_pairs
+
         rename_ratio = rename_count / total_events
-
         triggered = rename_ratio >= self.threshold and rename_count >= self._min_renames
-
         severity = 0.0
         if triggered:
             ratio_factor = (rename_ratio - self.threshold) / max(
@@ -104,13 +125,13 @@ class RenameRatioSignalEvaluator(BaseSignalEvaluator):
         if triggered:
             explanation = (
                 f"Abnormal rename ratio detected: {rename_count}/{total_events} "
-                f"operations ({rename_ratio:.1%}) are verified rename pairs "
+                f"operations ({rename_ratio:.1%}) are verified correlated rename pairs "
                 f"(threshold: {self.threshold:.1%}, min renames: {self._min_renames})"
             )
         else:
             explanation = (
                 f"Rename ratio within acceptable limits: {rename_count}/{total_events} "
-                f"({rename_ratio:.1%}) renames (threshold: {self.threshold:.1%})"
+                f"({rename_ratio:.1%}) verified (threshold: {self.threshold:.1%})"
             )
 
         return self._create_result(
@@ -122,8 +143,8 @@ class RenameRatioSignalEvaluator(BaseSignalEvaluator):
             metadata={
                 "rename_count": rename_count,
                 "verified_rename_pairs_count": rename_count,
+                "stats_rename_pairs_count": stats_pairs,
+                "stats_discrepancy": stats_discrepancy,
                 "total_events": total_events,
-                "rename_ratio": round(rename_ratio, 4),
-                "threshold_ratio": self.threshold,
             },
         )

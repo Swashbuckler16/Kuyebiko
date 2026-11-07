@@ -34,6 +34,9 @@ def _make_event(
     if event_type == EventType.RENAMED:
         kwargs["old_path"] = old_path or "dir/old.txt"
         kwargs["new_path"] = new_path or file_path
+        kwargs["correlation_provenance"] = (
+            f"rename_correlator:{kwargs['old_path']}->{kwargs['new_path']}"
+        )
     return FileEvent(**kwargs)
 
 
@@ -407,6 +410,16 @@ def test_evicted_root_telemetry_loss_recovers_after_full_observation_window():
     assert ctx_early.is_telemetry_degraded is True
     assert (
         "root_previously_evicted_due_to_capacity_limit" in ctx_early.degradation_reason
+    )
+
+    # Add intermediate event during re-observation period
+    correlator.add_event(
+        _make_event(
+            root_id="r1",
+            monotonic_ns=t_reappear + 5_000_000_000,
+            event_id="e1_new_mid",
+        ),
+        now_monotonic_ns=t_reappear + 5_000_000_000,
     )
 
     # Advance time beyond full 10s observation window (e.g. t_reappear + 11s)

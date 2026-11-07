@@ -231,9 +231,11 @@ class RootSlidingWindow:
             case EventType.RENAMED:
                 self._renamed_count += 1
                 if (
-                    event.old_path
+                    not event.is_directory
+                    and event.old_path
                     and event.new_path
                     and event.old_path != event.new_path
+                    and event.correlation_provenance is not None
                 ):
                     self._rename_pairs_count += 1
 
@@ -261,9 +263,11 @@ class RootSlidingWindow:
             case EventType.RENAMED:
                 self._renamed_count = max(0, self._renamed_count - 1)
                 if (
-                    event.old_path
+                    not event.is_directory
+                    and event.old_path
                     and event.new_path
                     and event.old_path != event.new_path
+                    and event.correlation_provenance is not None
                 ):
                     self._rename_pairs_count = max(0, self._rename_pairs_count - 1)
 
@@ -306,6 +310,13 @@ class RootSlidingWindow:
             if total > 0:
                 eps = total / self._window_duration_seconds
 
+            # Sort path list for small collections (unit tests & inspection);
+            # for high-load collections (> 200 paths), use O(n) direct key list
+            if len(self._path_counts) <= 200:
+                u_paths = sorted(self._path_counts.keys())
+            else:
+                u_paths = list(self._path_counts.keys())
+
             return WindowAggregateStats(
                 total_events=total,
                 created_count=self._created_count,
@@ -315,7 +326,7 @@ class RootSlidingWindow:
                 directory_operations_count=self._directory_operations_count,
                 unique_extensions=sorted(self._ext_counts.keys()),
                 unique_directories=sorted(self._dir_counts.keys()),
-                unique_relative_paths=sorted(self._path_counts.keys()),
+                unique_relative_paths=u_paths,
                 rename_pairs_count=self._rename_pairs_count,
                 events_per_second=round(eps, 2),
                 window_duration_seconds=self._window_duration_seconds,
@@ -478,66 +489,87 @@ class SlidingWindowCorrelator:
                 start_utc = now_utc
                 end_utc = now_utc
 
-            degraded = is_telemetry_degraded
-            deg_reason = degradation_reason
+            # Track degradation reasons independently
+            active_degradation_reasons: list[str] = []
 
-            # Capacity degradation recovers automatically when active drops reach 0
+            # 1. External Watcher / Pipeline Degradation
+            if is_telemetry_degraded:
+                active_degradation_reasons.append(
+                    degradation_reason or "external_telemetry_degraded"
+                )
+            elif quality not in (
+                TelemetryQuality.NORMAL,
+                TelemetryQuality.RECOVERED,
+            ):
+                active_degradation_reasons.append(f"telemetry_quality_{quality.value}")
+
+            if uncounted_kernel_loss:
+                active_degradation_reasons.append("uncounted_kernel_loss")
+
+            # 2. Sliding Window Capacity Drops (independently tracked)
             if window.active_capacity_dropped_events > 0:
-                degraded = True
                 drops = window.active_capacity_dropped_events
-                capacity_msg = f"sliding_window_capacity_dropped:{drops}"
-                deg_reason = (
-                    f"{deg_reason}; {capacity_msg}" if deg_reason else capacity_msg
+                active_degradation_reasons.append(
+                    f"sliding_window_capacity_dropped:{drops}"
                 )
 
-            # Retrograde degradation recovers automatically when active drops reach 0
+            # 3. Retrograde (Late Expired) Event Drops (independently tracked)
             if window.active_retrograde_dropped_events > 0:
-                degraded = True
-                retrograde_drops = window.active_retrograde_dropped_events
-                retrograde_msg = f"retrograde_events_dropped:{retrograde_drops}"
-                deg_reason = (
-                    f"{deg_reason}; {retrograde_msg}" if deg_reason else retrograde_msg
-                )
+                drops = window.active_retrograde_dropped_events
+                active_degradation_reasons.append(f"retrograde_events_dropped:{drops}")
 
-            # Check if this root was previously evicted due to root capacity limit
+            # 4. Root Eviction Telemetry Loss & Recovery Check
             if root_id in self._evicted_roots_loss:
                 reseen_ns = self._evicted_root_reseen_monotonic.get(root_id, clock_ns)
                 time_since_reseen = clock_ns - reseen_ns
                 window_duration_ns = int(self._window_duration_seconds * 1_000_000_000)
 
-                # Recovery criteria:
-                # A complete observation window has been re-established once:
-                # 1. Continuous events in window span >= window_duration, OR
-                # 2. Elapsed monitoring time since re-appearance >= window_duration,
-                # AND no active capacity or retrograde drops are currently recorded.
-                has_full_span = (
-                    len(events) >= 2
-                    and (events[-1].monotonic_ns - events[0].monotonic_ns)
+                # Recovery requires genuine observation continuity evidence:
+                # - Must have active events demonstrating continuity (>= 2 events)
+                # - Span of active events >= window_duration, OR
+                #   elapsed time since reseen >= window_duration with recent event
+                # - External watcher must be healthy (no degradation, no kernel loss)
+                # - Window must have no active drops (capacity and retrograde == 0)
+                has_continuity_evidence = len(events) >= 2 and (
+                    (events[-1].monotonic_ns - events[0].monotonic_ns)
                     >= window_duration_ns
+                    or (
+                        time_since_reseen >= window_duration_ns
+                        and (clock_ns - events[-1].monotonic_ns) <= window_duration_ns
+                    )
                 )
-                has_elapsed_full_window = time_since_reseen >= window_duration_ns
-
-                if (has_full_span or has_elapsed_full_window) and (
+                is_watcher_healthy = (
+                    not is_telemetry_degraded
+                    and not uncounted_kernel_loss
+                    and quality in (TelemetryQuality.NORMAL, TelemetryQuality.RECOVERED)
+                )
+                is_window_healthy = (
                     window.active_capacity_dropped_events == 0
                     and window.active_retrograde_dropped_events == 0
-                ):
-                    # Clean observation window restored; clear eviction degradation
+                )
+
+                if has_continuity_evidence and is_watcher_healthy and is_window_healthy:
+                    # Eviction loss state genuinely recovered!
                     self._evicted_roots_loss.pop(root_id, None)
                     self._evicted_root_reseen_monotonic.pop(root_id, None)
                     logger.info(
-                        "Root '%s' re-established complete observation window; "
+                        "Root '%s' observation continuity confirmed (%d events); "
                         "eviction degradation cleared.",
                         root_id,
+                        len(events),
                     )
                 else:
-                    degraded = True
-                    eviction_msg = (
-                        f"root_previously_evicted_due_to_capacity_limit:"
-                        f"{self._evicted_roots_loss[root_id]}"
+                    eviction_loss_time = self._evicted_roots_loss[root_id]
+                    active_degradation_reasons.append(
+                        f"root_previously_evicted_due_to_capacity_limit:{eviction_loss_time}"
                     )
-                    deg_reason = (
-                        f"{deg_reason}; {eviction_msg}" if deg_reason else eviction_msg
-                    )
+
+            degraded = bool(active_degradation_reasons)
+            deg_reason = (
+                "; ".join(active_degradation_reasons)
+                if active_degradation_reasons
+                else None
+            )
 
             return DetectionContext(
                 root_id=root_id,

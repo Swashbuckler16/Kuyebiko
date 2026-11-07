@@ -45,6 +45,7 @@ class FileEvent(BaseModel):
     old_path: str | None = None
     new_path: str | None = None
     is_directory: bool | None = None
+    correlation_provenance: str | None = None
 
     timestamp_utc: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
