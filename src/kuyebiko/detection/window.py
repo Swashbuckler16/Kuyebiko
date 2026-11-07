@@ -3,6 +3,14 @@
 Provides chronological, bounded per-root event buffering, monotonic time-based
 expiration, out-of-order handling, and O(1) incremental aggregation for
 behavioural ransomware signals.
+
+Complexity Characteristics:
+- Normal Chronological Arrival (Fast Path): Amortized O(1) append to event and
+  timestamp structures.
+- Out-of-Order Arrival (Worst Case): O(log n) binary search on pre-allocated
+  monotonic timestamp array + O(n) element shift for in-place list insertion.
+- Expiration: Amortized O(k) where k is the number of expired events.
+- Aggregate Statistics: O(1) instantaneous access via incremental counters.
 """
 
 import bisect
@@ -46,9 +54,10 @@ class RootSlidingWindow:
         self._max_events = max_events
 
         self._lock = threading.RLock()
-        # Chronologically sorted list of events and ordering metadata
+        # Chronologically sorted list of events, ordering metadata, and timestamps
         self._events: list[FileEvent] = []
         self._ordering_meta: list[EventOrderingMetadata | None] = []
+        self._timestamps: list[int] = []
 
         # Incremental counters for O(1) access
         self._created_count = 0
@@ -65,7 +74,10 @@ class RootSlidingWindow:
         # Capacity drop tracking with recovery: drops within active horizon
         self._capacity_drop_timestamps: deque[int] = deque()
         self._cumulative_capacity_dropped: int = 0
-        self._expired_retrograde_drops: int = 0
+
+        # Retrograde (expired out-of-order) drop tracking with recovery
+        self._retrograde_drop_timestamps: deque[int] = deque()
+        self._cumulative_retrograde_dropped: int = 0
 
         self._last_event_monotonic_ns: int | None = None
         self._last_event_utc: datetime | None = None
@@ -96,13 +108,37 @@ class RootSlidingWindow:
         with self._lock:
             return self._cumulative_capacity_dropped
 
+    @property
+    def retrograde_dropped_events(self) -> int:
+        """Active retrograde drops within current sliding window horizon."""
+        with self._lock:
+            return len(self._retrograde_drop_timestamps)
+
+    @property
+    def active_retrograde_dropped_events(self) -> int:
+        """Active retrograde drops within current sliding window horizon."""
+        with self._lock:
+            return len(self._retrograde_drop_timestamps)
+
+    @property
+    def cumulative_retrograde_dropped_events(self) -> int:
+        """Total cumulative retrograde drops since window creation."""
+        with self._lock:
+            return self._cumulative_retrograde_dropped
+
     def add_event(
         self,
         event: FileEvent,
         ordering: EventOrderingMetadata | None = None,
         now_monotonic_ns: int | None = None,
     ) -> None:
-        """Append or chronologically insert a normalized FileEvent."""
+        """Append or chronologically insert a normalized FileEvent.
+
+        Complexity:
+        - Fast path: Amortized O(1) when event is empty or arrives >= latest event.
+        - Out-of-order path: O(log n) binary search in pre-maintained monotonic
+          timestamps followed by O(n) list insertion.
+        """
         if event.root_id != self._root_id:
             raise ValueError(
                 f"Event root_id {event.root_id} does not match "
@@ -117,20 +153,23 @@ class RootSlidingWindow:
 
             # Check if this event arrived out-of-order and is already expired
             if (clock_ns - event.monotonic_ns) > self._window_duration_ns:
-                # Event is outside active window horizon; do not pollute window
-                self._expired_retrograde_drops += 1
+                # Event is outside active window horizon; record telemetry drop
+                self._retrograde_drop_timestamps.append(clock_ns)
+                self._cumulative_retrograde_dropped += 1
                 return
 
-            # Chronological insertion: if newer or empty, append in O(1)
-            if not self._events or event.monotonic_ns >= self._events[-1].monotonic_ns:
+            # Fast path (O(1) amortized): Chronological arrival
+            if not self._timestamps or event.monotonic_ns >= self._timestamps[-1]:
                 self._events.append(event)
                 self._ordering_meta.append(ordering)
+                self._timestamps.append(event.monotonic_ns)
             else:
-                # Out-of-order event: insert at exact chronological position via bisect
-                timestamps = [e.monotonic_ns for e in self._events]
-                idx = bisect.bisect_right(timestamps, event.monotonic_ns)
+                # Out-of-order path: O(log n) binary search + O(n) list insertion
+                # Reuses parallel self._timestamps without dynamic list allocations
+                idx = bisect.bisect_right(self._timestamps, event.monotonic_ns)
                 self._events.insert(idx, event)
                 self._ordering_meta.insert(idx, ordering)
+                self._timestamps.insert(idx, event.monotonic_ns)
 
             self._include_event_locked(event)
 
@@ -164,6 +203,13 @@ class RootSlidingWindow:
         ):
             self._capacity_drop_timestamps.popleft()
 
+        # Expire old retrograde drop records so degradation recovers
+        while (
+            self._retrograde_drop_timestamps
+            and self._retrograde_drop_timestamps[0] < cutoff_ns
+        ):
+            self._retrograde_drop_timestamps.popleft()
+
         return evicted
 
     def _evict_oldest_locked(self) -> None:
@@ -171,6 +217,7 @@ class RootSlidingWindow:
             return
         evicted_event = self._events.pop(0)
         self._ordering_meta.pop(0)
+        self._timestamps.pop(0)
         self._exclude_event_locked(evicted_event)
 
     def _include_event_locked(self, event: FileEvent) -> None:
@@ -279,6 +326,7 @@ class RootSlidingWindow:
         with self._lock:
             self._events.clear()
             self._ordering_meta.clear()
+            self._timestamps.clear()
             self._created_count = 0
             self._modified_count = 0
             self._deleted_count = 0
@@ -290,7 +338,8 @@ class RootSlidingWindow:
             self._dir_counts.clear()
             self._capacity_drop_timestamps.clear()
             self._cumulative_capacity_dropped = 0
-            self._expired_retrograde_drops = 0
+            self._retrograde_drop_timestamps.clear()
+            self._cumulative_retrograde_dropped = 0
             self._last_event_monotonic_ns = None
             self._last_event_utc = None
 
@@ -326,6 +375,7 @@ class SlidingWindowCorrelator:
         self._last_activity_monotonic: dict[str, int] = {}
         # Explicit telemetry loss tracking for forcefully evicted roots
         self._evicted_roots_loss: dict[str, int] = {}
+        self._evicted_root_reseen_monotonic: dict[str, int] = {}
         self._total_evicted_roots_count: int = 0
         self._lock = threading.RLock()
 
@@ -370,6 +420,7 @@ class SlidingWindowCorrelator:
                         oldest_idle_root,
                     )
                     self._evicted_roots_loss[oldest_idle_root] = clock_ns
+                    self._evicted_root_reseen_monotonic.pop(oldest_idle_root, None)
                     self._total_evicted_roots_count += 1
                     self.remove_root(oldest_idle_root)
 
@@ -378,6 +429,13 @@ class SlidingWindowCorrelator:
                     window_duration_seconds=self._window_duration_seconds,
                     max_events=self._max_events_per_root,
                 )
+
+            # If this root was evicted and returned, record re-seen timestamp
+            if (
+                root_id in self._evicted_roots_loss
+                and root_id not in self._evicted_root_reseen_monotonic
+            ):
+                self._evicted_root_reseen_monotonic[root_id] = clock_ns
 
             self._last_activity_monotonic[root_id] = clock_ns
             self._windows[root_id].add_event(
@@ -432,16 +490,54 @@ class SlidingWindowCorrelator:
                     f"{deg_reason}; {capacity_msg}" if deg_reason else capacity_msg
                 )
 
+            # Retrograde degradation recovers automatically when active drops reach 0
+            if window.active_retrograde_dropped_events > 0:
+                degraded = True
+                retrograde_drops = window.active_retrograde_dropped_events
+                retrograde_msg = f"retrograde_events_dropped:{retrograde_drops}"
+                deg_reason = (
+                    f"{deg_reason}; {retrograde_msg}" if deg_reason else retrograde_msg
+                )
+
             # Check if this root was previously evicted due to root capacity limit
             if root_id in self._evicted_roots_loss:
-                degraded = True
-                eviction_msg = (
-                    f"root_previously_evicted_due_to_capacity_limit:"
-                    f"{self._evicted_roots_loss[root_id]}"
+                reseen_ns = self._evicted_root_reseen_monotonic.get(root_id, clock_ns)
+                time_since_reseen = clock_ns - reseen_ns
+                window_duration_ns = int(self._window_duration_seconds * 1_000_000_000)
+
+                # Recovery criteria:
+                # A complete observation window has been re-established once:
+                # 1. Continuous events in window span >= window_duration, OR
+                # 2. Elapsed monitoring time since re-appearance >= window_duration,
+                # AND no active capacity or retrograde drops are currently recorded.
+                has_full_span = (
+                    len(events) >= 2
+                    and (events[-1].monotonic_ns - events[0].monotonic_ns)
+                    >= window_duration_ns
                 )
-                deg_reason = (
-                    f"{deg_reason}; {eviction_msg}" if deg_reason else eviction_msg
-                )
+                has_elapsed_full_window = time_since_reseen >= window_duration_ns
+
+                if (has_full_span or has_elapsed_full_window) and (
+                    window.active_capacity_dropped_events == 0
+                    and window.active_retrograde_dropped_events == 0
+                ):
+                    # Clean observation window restored; clear eviction degradation
+                    self._evicted_roots_loss.pop(root_id, None)
+                    self._evicted_root_reseen_monotonic.pop(root_id, None)
+                    logger.info(
+                        "Root '%s' re-established complete observation window; "
+                        "eviction degradation cleared.",
+                        root_id,
+                    )
+                else:
+                    degraded = True
+                    eviction_msg = (
+                        f"root_previously_evicted_due_to_capacity_limit:"
+                        f"{self._evicted_roots_loss[root_id]}"
+                    )
+                    deg_reason = (
+                        f"{deg_reason}; {eviction_msg}" if deg_reason else eviction_msg
+                    )
 
             return DetectionContext(
                 root_id=root_id,
@@ -508,4 +604,5 @@ class SlidingWindowCorrelator:
             self._windows.clear()
             self._last_activity_monotonic.clear()
             self._evicted_roots_loss.clear()
+            self._evicted_root_reseen_monotonic.clear()
             self._total_evicted_roots_count = 0

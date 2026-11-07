@@ -116,3 +116,18 @@ Evaluation cycles yield structured `DetectionOutcome` values:
 3. **Strict Memory Bounds:** Sliding windows maintain a hard cap on retained events (`max_events_per_root`) and automatically prune aged events using monotonic clocks.
 4. **Deterministic & Explainable:** Every trigger provides specific event IDs, measured ratios, and concrete thresholds.
 
+---
+
+## 6. Sliding-Window Mechanics & Complexity Profiles
+
+### 6.1 Insertion Complexity
+- **Fast Path (Amortized O(1)):** Under standard chronological event arrival, events and their monotonic timestamps are appended directly to `_events` and a parallel `_timestamps: list[int]` array.
+- **Out-of-Order Worst Case (O(n)):** For rare out-of-order events arriving within the active window horizon, the insertion index is located via O(log n) binary search (`bisect_right`) over the pre-maintained `_timestamps` array, followed by an O(n) element shift to insert the event. This avoids intermediate list allocations while maintaining strictly sorted chronological order.
+- **Retrograde Event Handling:** Events whose timestamps are older than the active window duration (`clock_ns - monotonic_ns > window_duration_ns`) are dropped. Their occurrence is tracked via a timestamped deque (`_retrograde_drop_timestamps`) and immediately degrades `DetectionContext` telemetry (`is_telemetry_degraded = True`, reason: `retrograde_events_dropped:N`).
+
+### 6.2 Degradation & Telemetry Loss Recovery
+All internal degradation sources feature deterministic, time-bounded recovery policies:
+1. **Window Capacity Drops:** Tracked via `_capacity_drop_timestamps: deque[int]`. Once expired relative to the sliding window duration horizon (`cutoff_ns = now_monotonic_ns - window_duration_ns`), the drop records are evicted and telemetry degradation automatically clears.
+2. **Retrograde Event Drops:** Tracked via `_retrograde_drop_timestamps: deque[int]`. Expired once their drop timestamps fall outside the active window duration horizon.
+3. **Root Eviction Telemetry Loss:** When the correlator reaches capacity (`max_active_roots`), the oldest idle root is evicted and its loss timestamp recorded in `_evicted_roots_loss`. When the evicted root returns, it is initially flagged as degraded until a full, continuous observation window (duration >= `window_duration_seconds`) has been re-established without further active drops, at which point the eviction loss record is removed and normal telemetry status is restored.
+

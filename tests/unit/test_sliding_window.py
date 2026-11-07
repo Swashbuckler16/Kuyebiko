@@ -332,3 +332,254 @@ def test_sliding_window_ordering_metadata_support():
 
     events = window.get_events()
     assert len(events) == 1
+
+
+def test_retrograde_event_drop_propagates_telemetry_degradation_and_recovers():
+    """Retrograde drops outside the window horizon degrade telemetry and recover."""
+    correlator = SlidingWindowCorrelator(window_duration_seconds=10.0)
+    root = "root-retro"
+    base_ns = 20_000_000_000
+
+    # Normal event at t=20s
+    correlator.add_event(
+        _make_event(root_id=root, monotonic_ns=base_ns, event_id="e-norm"),
+        now_monotonic_ns=base_ns,
+    )
+    ctx_normal = correlator.get_context(root, now_monotonic_ns=base_ns)
+    assert ctx_normal is not None
+    assert ctx_normal.is_telemetry_degraded is False
+
+    # Retrograde event at clock=20s with monotonic_ns=5s (older by 15s > 10s window)
+    correlator.add_event(
+        _make_event(
+            root_id=root, monotonic_ns=base_ns - 15_000_000_000, event_id="e-old"
+        ),
+        now_monotonic_ns=base_ns,
+    )
+
+    # Telemetry should immediately reflect the dropped retrograde event
+    ctx_degraded = correlator.get_context(root, now_monotonic_ns=base_ns)
+    assert ctx_degraded is not None
+    assert ctx_degraded.is_telemetry_degraded is True
+    assert "retrograde_events_dropped:1" in ctx_degraded.degradation_reason
+
+    # 11 seconds later, the retrograde drop timestamp has passed the 10s horizon
+    recovery_ns = base_ns + 11_000_000_000
+    ctx_recovered = correlator.get_context(root, now_monotonic_ns=recovery_ns)
+    assert ctx_recovered is not None
+    assert ctx_recovered.is_telemetry_degraded is False
+    assert ctx_recovered.degradation_reason is None
+
+
+def test_evicted_root_telemetry_loss_recovers_after_full_observation_window():
+    """Evicted root degradation marks initially, then recovers after a full window."""
+    correlator = SlidingWindowCorrelator(
+        window_duration_seconds=10.0, max_active_roots=2
+    )
+    t0 = 10_000_000_000
+
+    correlator.add_event(
+        _make_event(root_id="r1", monotonic_ns=t0, event_id="e1"), now_monotonic_ns=t0
+    )
+    correlator.add_event(
+        _make_event(root_id="r2", monotonic_ns=t0 + 1_000_000_000, event_id="e2"),
+        now_monotonic_ns=t0 + 1_000_000_000,
+    )
+    # Evict r1 by adding r3
+    correlator.add_event(
+        _make_event(root_id="r3", monotonic_ns=t0 + 2_000_000_000, event_id="e3"),
+        now_monotonic_ns=t0 + 2_000_000_000,
+    )
+    assert correlator.total_evicted_roots_count == 1
+
+    # r1 re-appears at t=15s
+    t_reappear = t0 + 5_000_000_000
+    correlator.add_event(
+        _make_event(root_id="r1", monotonic_ns=t_reappear, event_id="e1_new1"),
+        now_monotonic_ns=t_reappear,
+    )
+
+    # Within the 10s re-observation window, r1 must remain degraded
+    ctx_early = correlator.get_context(
+        "r1", now_monotonic_ns=t_reappear + 3_000_000_000
+    )
+    assert ctx_early is not None
+    assert ctx_early.is_telemetry_degraded is True
+    assert (
+        "root_previously_evicted_due_to_capacity_limit" in ctx_early.degradation_reason
+    )
+
+    # Advance time beyond full 10s observation window (e.g. t_reappear + 11s)
+    t_recovered = t_reappear + 11_000_000_000
+    correlator.add_event(
+        _make_event(root_id="r1", monotonic_ns=t_recovered, event_id="e1_new2"),
+        now_monotonic_ns=t_recovered,
+    )
+    ctx_recovered = correlator.get_context("r1", now_monotonic_ns=t_recovered)
+    assert ctx_recovered is not None
+    assert ctx_recovered.is_telemetry_degraded is False
+    assert ctx_recovered.degradation_reason is None
+
+
+def test_chronological_fast_path_and_out_of_order_insertion_integrity():
+    """Verify fast-path appends and out-of-order bisect insertions maintain order."""
+    window = RootSlidingWindow(root_id="root-1", window_duration_seconds=20.0)
+
+    # Fast path: ordered chronological arrivals
+    timestamps = [1000, 2000, 3000, 5000, 8000]
+    for i, ts in enumerate(timestamps):
+        window.add_event(
+            _make_event(root_id="root-1", monotonic_ns=ts, event_id=f"f{i}")
+        )
+
+    # Out-of-order insertions at intermediate points
+    window.add_event(
+        _make_event(root_id="root-1", monotonic_ns=2500, event_id="ooo1"),
+        now_monotonic_ns=8000,
+    )
+    window.add_event(
+        _make_event(root_id="root-1", monotonic_ns=1500, event_id="ooo2"),
+        now_monotonic_ns=8000,
+    )
+    window.add_event(
+        _make_event(root_id="root-1", monotonic_ns=4000, event_id="ooo3"),
+        now_monotonic_ns=8000,
+    )
+
+    events = window.get_events()
+    event_ts = [e.monotonic_ns for e in events]
+    assert event_ts == sorted(event_ts)
+    assert event_ts == [1000, 1500, 2000, 2500, 3000, 4000, 5000, 8000]
+    assert [e.event_id for e in events] == [
+        "f0",
+        "ooo2",
+        "f1",
+        "ooo1",
+        "f2",
+        "ooo3",
+        "f3",
+        "f4",
+    ]
+
+
+def test_retrograde_event_drop_propagates_telemetry_degradation_and_recovers():
+    """Retrograde drops outside the window horizon degrade telemetry and recover."""
+    correlator = SlidingWindowCorrelator(window_duration_seconds=10.0)
+    root = "root-retro"
+    base_ns = 20_000_000_000
+
+    # Normal event at t=20s
+    correlator.add_event(
+        _make_event(root_id=root, monotonic_ns=base_ns, event_id="e-norm"),
+        now_monotonic_ns=base_ns,
+    )
+    ctx_normal = correlator.get_context(root, now_monotonic_ns=base_ns)
+    assert ctx_normal is not None
+    assert ctx_normal.is_telemetry_degraded is False
+
+    # Retrograde event at clock=20s with monotonic_ns=5s (older by 15s > 10s window)
+    correlator.add_event(
+        _make_event(
+            root_id=root, monotonic_ns=base_ns - 15_000_000_000, event_id="e-old"
+        ),
+        now_monotonic_ns=base_ns,
+    )
+
+    # Telemetry should immediately reflect the dropped retrograde event
+    ctx_degraded = correlator.get_context(root, now_monotonic_ns=base_ns)
+    assert ctx_degraded is not None
+    assert ctx_degraded.is_telemetry_degraded is True
+    assert "retrograde_events_dropped:1" in ctx_degraded.degradation_reason
+
+    # 11 seconds later, the retrograde drop timestamp has passed the 10s horizon
+    recovery_ns = base_ns + 11_000_000_000
+    ctx_recovered = correlator.get_context(root, now_monotonic_ns=recovery_ns)
+    assert ctx_recovered is not None
+    assert ctx_recovered.is_telemetry_degraded is False
+    assert ctx_recovered.degradation_reason is None
+
+
+def test_evicted_root_telemetry_loss_recovers_after_full_observation_window():
+    """Evicted root degradation marks initially, then recovers after a full window."""
+    correlator = SlidingWindowCorrelator(
+        window_duration_seconds=10.0, max_active_roots=2
+    )
+    t0 = 10_000_000_000
+
+    correlator.add_event(
+        _make_event(root_id="r1", monotonic_ns=t0, event_id="e1"), now_monotonic_ns=t0
+    )
+    correlator.add_event(
+        _make_event(root_id="r2", monotonic_ns=t0 + 1_000_000_000, event_id="e2"),
+        now_monotonic_ns=t0 + 1_000_000_000,
+    )
+    # Evict r1 by adding r3
+    correlator.add_event(
+        _make_event(root_id="r3", monotonic_ns=t0 + 2_000_000_000, event_id="e3"),
+        now_monotonic_ns=t0 + 2_000_000_000,
+    )
+    assert correlator.total_evicted_roots_count == 1
+
+    # r1 re-appears at t=15s
+    t_reappear = t0 + 5_000_000_000
+    correlator.add_event(
+        _make_event(root_id="r1", monotonic_ns=t_reappear, event_id="e1_new1"),
+        now_monotonic_ns=t_reappear,
+    )
+
+    # Within the 10s re-observation window, r1 must remain degraded
+    ctx_early = correlator.get_context(
+        "r1", now_monotonic_ns=t_reappear + 3_000_000_000
+    )
+    assert ctx_early is not None
+    assert ctx_early.is_telemetry_degraded is True
+    assert (
+        "root_previously_evicted_due_to_capacity_limit"
+        in ctx_early.degradation_reason
+    )
+
+    # Advance time beyond full 10s observation window (e.g. t_reappear + 11s)
+    t_recovered = t_reappear + 11_000_000_000
+    correlator.add_event(
+        _make_event(root_id="r1", monotonic_ns=t_recovered, event_id="e1_new2"),
+        now_monotonic_ns=t_recovered,
+    )
+    ctx_recovered = correlator.get_context("r1", now_monotonic_ns=t_recovered)
+    assert ctx_recovered is not None
+    assert ctx_recovered.is_telemetry_degraded is False
+    assert ctx_recovered.degradation_reason is None
+
+
+def test_chronological_fast_path_and_out_of_order_insertion_integrity():
+    """Verify fast-path appends and out-of-order bisect insertions maintain order."""
+    window = RootSlidingWindow(root_id="root-1", window_duration_seconds=20.0)
+
+    # Fast path: ordered chronological arrivals
+    timestamps = [1000, 2000, 3000, 5000, 8000]
+    for i, ts in enumerate(timestamps):
+        window.add_event(
+            _make_event(root_id="root-1", monotonic_ns=ts, event_id=f"f{i}")
+        )
+
+    # Out-of-order insertions at intermediate points
+    window.add_event(
+        _make_event(root_id="root-1", monotonic_ns=2500, event_id="ooo1"),
+        now_monotonic_ns=8000,
+    )
+    window.add_event(
+        _make_event(root_id="root-1", monotonic_ns=1500, event_id="ooo2"),
+        now_monotonic_ns=8000,
+    )
+    window.add_event(
+        _make_event(root_id="root-1", monotonic_ns=4000, event_id="ooo3"),
+        now_monotonic_ns=8000,
+    )
+
+    events = window.get_events()
+    event_ts = [e.monotonic_ns for e in events]
+    assert event_ts == sorted(event_ts)
+    assert event_ts == [1000, 1500, 2000, 2500, 3000, 4000, 5000, 8000]
+    assert [e.event_id for e in events] == [
+        "f0", "ooo2", "f1", "ooo1", "f2", "ooo3", "f3", "f4"
+    ]
+

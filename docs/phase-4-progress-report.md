@@ -5,28 +5,29 @@
 **License:** GNU General Public License v3.0 (GNU GPL v3.0)  
 **Date:** 2026-11-07  
 **Scope:** Phase 4 Steps 4.1–4.5 Core Detection Engine + Comprehensive Engineering Audit Fixes  
-**Test Suite:** 302 passed in 9.54s (100% pass rate)  
+**Test Suite:** 305 passed in 8.78s (100% pass rate)  
 **Code Coverage:** 93% statement coverage across 3,010 statements  
 
 ---
 
 ## 1. Executive Summary & Audit Resolution
 
-Following the initial implementation of Phase 4 Steps 4.1–4.5, a comprehensive engineering audit identified six critical and high-priority behavioural issues. All six have been resolved, verified with automated tests, benchmarked, and documented:
+Following the implementation of Phase 4 Steps 4.1–4.5, comprehensive audits and reviews identified edge cases across out-of-order handling, telemetry loss tracking, performance complexity, and degradation recovery. All issues have been resolved, verified with automated unit and integration tests, benchmarked, and documented:
 
-### Audit Issues Addressed & Resolved:
-1. **Critical — Out-of-Order Event Handling (`window.py`):**
-   - *Previous Defect:* Window expiration assumed events were appended chronologically. Retrograde events arriving behind newer events could remain stuck in the window past their expiration.
-   - *Fix:* `RootSlidingWindow` now maintains strictly sorted chronological storage using monotonic timestamps (`bisect.bisect_right`). Events arriving out-of-order that are already older than the window horizon are dropped immediately without polluting the window. Because storage is strictly sorted, `self._events[0]` is guaranteed to be the oldest event, ensuring deterministic O(k) expiration at the exact due time.
+### Audit & Review Issues Addressed & Resolved:
+1. **Critical — Out-of-Order Event Handling & Retrograde Drop Telemetry (`window.py`):**
+   - *Previous Defect:* Window expiration assumed events were appended chronologically. Older events arriving out-of-order could remain stuck in the window past expiration. Additionally, expired retrograde events were silently dropped without propagating degradation to `DetectionContext`.
+   - *Fix:* `RootSlidingWindow` now maintains strictly sorted chronological storage using monotonic timestamps (`bisect.bisect_right`). Events arriving out-of-order that are already older than the window horizon are dropped, recorded with drop timestamps, and explicitly propagate `is_telemetry_degraded = True` (`retrograde_events_dropped:N`). Because storage is strictly sorted, `self._events[0]` is guaranteed to be the oldest event, ensuring deterministic O(k) expiration at the exact due time. Retrograde drop degradation automatically recovers once the drop timestamp passes the sliding window duration.
 2. **Critical — Performance Scaling & Evaluator Pre-Screening (`engine.py`, signals):**
    - *Previous Defect:* Every incoming event triggered full evaluation of all 5 signals, repeatedly scanning complete event collections.
    - *Fix:* Added O(1) statistical pre-screening guards to all five evaluators using `context.stats`. If precomputed counts (writes, deletes, renames, unique directories, unique paths) cannot meet signal thresholds, evaluators exit immediately in O(1) without iterating over `context.events`. Added configurable evaluation interval throttling (`eval_interval_events: int = 1`).
+   - *Complexity Clarity:* Chronological insertion clearly distinguishes fast path (amortized O(1) append for chronological arrivals) from the worst-case out-of-order path (O(log n) binary search on parallel pre-maintained timestamp array + O(n) list insertion).
 3. **High — Window Capacity Degradation Recovery (`window.py`):**
    - *Previous Defect:* `capacity_dropped_events` remained cumulative, causing a root to stay marked as degraded permanently even after affected events expired.
    - *Fix:* Replaced static cumulative counter with sliding-horizon drop tracking (`_capacity_drop_timestamps: deque[int]`). Drops expire as monotonic clock moves past `window_duration_seconds`. Once active drops reach 0, telemetry quality recovers automatically (`is_telemetry_degraded = False`).
-4. **High — Active-Root Eviction Telemetry Loss (`window.py`):**
-   - *Previous Defect:* When `max_active_roots` capacity was reached, the oldest idle root was silently evicted without preserving telemetry loss provenance.
-   - *Fix:* `SlidingWindowCorrelator` now explicitly tracks evicted roots in `_evicted_roots_loss` with timestamps, increments `_total_evicted_roots_count`, logs warning telemetry, and propagates `is_telemetry_degraded = True` with `root_previously_evicted_due_to_capacity_limit` when an evicted root re-appears.
+4. **High — Active-Root Eviction Telemetry Loss & Recovery Mechanism (`window.py`):**
+   - *Previous Defect:* When `max_active_roots` capacity was reached, the oldest idle root was evicted without telemetry loss provenance. When provenance was added, there was no recovery mechanism, leaving returning roots permanently degraded.
+   - *Fix:* `SlidingWindowCorrelator` now explicitly tracks evicted roots in `_evicted_roots_loss` with timestamps, increments `_total_evicted_roots_count`, logs warning telemetry, and propagates `is_telemetry_degraded = True` with `root_previously_evicted_due_to_capacity_limit` when an evicted root re-appears. A deterministic recovery policy clears eviction degradation once a complete, uninterrupted observation window (duration >= `window_duration_seconds`) has been re-established without further active drops.
 5. **High — Rename Signal Semantic Verification (`rename_ratio.py`):**
    - *Previous Defect:* The rename evaluator required old and new paths, but did not independently verify that its count represented confirmed, distinct file rename pairs.
    - *Fix:* `RenameRatioSignalEvaluator` now enforces independent verification: checks that `old_path != new_path`, verifies both paths are valid relative paths, excludes directory renames, cross-references against `context.stats.rename_pairs_count`, and records verified rename pairs in metadata.
@@ -78,13 +79,16 @@ Following the initial implementation of Phase 4 Steps 4.1–4.5, a comprehensive
 
 ## 3. Test Suite Verification
 
-### Test Breakdown (302 passed in 9.54s):
+### Test Breakdown (305 passed in 8.78s):
 - **Phase 1–3 Tests:** 256 passed
 - **Phase 4 Detection Contracts:** 8 passed (`tests/unit/test_detection_contracts.py`)
-- **Phase 4 Sliding Window:** 11 passed (`tests/unit/test_sliding_window.py`)
+- **Phase 4 Sliding Window:** 14 passed (`tests/unit/test_sliding_window.py`)
   - Includes out-of-order chronological insertion & expiration test
   - Includes capacity drop degradation recovery test
   - Includes active root eviction telemetry loss test
+  - Includes retrograde drop degradation & automatic recovery test
+  - Includes evicted root observation window recovery test
+  - Includes chronological fast-path vs bisect insertion integrity test
 - **Phase 4 Signal Registry:** 7 passed (`tests/unit/test_signal_registry.py`)
 - **Phase 4 Behaviour Signals:** 10 passed (`tests/unit/test_detection_signals.py`)
   - Includes distinct rename pair verification & directory rename rejection
