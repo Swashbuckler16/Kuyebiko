@@ -43,3 +43,11 @@ class WorkerLifecycleError(ProcessingError):
 
 class PipelineLifecycleError(ProcessingError):
     """Raised when an invalid pipeline lifecycle transition occurs or stop fails."""
+
+
+class DetectionError(KuyebikoError):
+    """Base exception for detection engine errors."""
+
+
+class EvaluatorExecutionError(DetectionError):
+    """Raised when an individual signal evaluator fails during execution."""

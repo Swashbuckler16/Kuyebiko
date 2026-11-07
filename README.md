@@ -319,6 +319,18 @@ Performance benchmarking was conducted on a reference 64-bit Windows 11 host (AM
 | | Pipeline Worker Restart Latency | **0.50 ms** |
 | **Memory Footprint** | Heap Allocation (tracemalloc) | **1.16 MB baseline / 3.76 MB peak** |
 
+### 8.5 Phase 4 Detection Engine Performance Baselines
+
+Benchmarking was conducted on a reference 64-bit Windows 11 host (AMD64, CPython 3.14.4) using `scripts/measure_phase4_performance.py` with all 5 foundational behaviour signals evaluating:
+
+| Workload Scenario | Event Volume & Roots | Throughput | Avg Latency | P95 Latency | Peak Heap |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Small Load** | 100 events, 1 root | **1,924.7 events/sec** | **0.52 ms** | **1.40 ms** | **0.08 MB** |
+| **Medium Load** | 1,000 events, 1 root | **326.7 events/sec** | **3.06 ms** | **6.37 ms** | **0.28 MB** |
+| **High Load** | 10,000 events, 1 root | **34.7 events/sec** | **28.82 ms** | **48.92 ms** | **2.12 MB** |
+| **Concurrent Multi-Root** | 4,000 events, 4 roots | **275.4 events/sec** | **3.63 ms** | **6.34 ms** | **0.86 MB** |
+| **High-Volume Multi-Root** | 10,000 events, 5 roots | **127.4 events/sec** | **7.85 ms** | **16.59 ms** | **2.05 MB** |
+
 ---
 
 ## 9. Security Scope & Explicit Limitations
@@ -346,7 +358,9 @@ Kuyebiko is engineered as a defensive, privacy-preserving visibility aid, but op
   - **Phase 2.4 — Hardened Collectors & Parsers:** Buffer boundary validation, overflow metrics, and regression testing. *(Complete)*
 - **Phase 3 — Event Processing & Normalization:**
   - Bounded queue backpressure, non-blocking ingestion, single worker thread, conservative deduplication (with TTL), ordering tracking, unified telemetry snapshot, and lifecycle management (`EventPipeline`). *(Complete)*
-- **Phase 4 — Behavioural Detection MVP:** Sliding time-window correlation, 10 signal evaluators, normalized scoring formulas, and relational incident persistence. *(Next Step)*
+- **Phase 4 — Behavioural Detection MVP:**
+  - **Steps 4.1–4.5 — Core Detection Engine & Foundational Signals:** Sliding-window event correlator, signal registry with exception isolation, multi-factor signal families, telemetry degradation handling, and five foundational ransomware signals (`FS_BURST_WRITE`, `FS_RENAME_RATIO`, `FS_DELETE_RATIO`, `FS_DIRECTORY_TRAVERSAL`, `FS_EXTENSION_CONVERGENCE`). *(Complete — 299 tests, 94% coverage)*
+  - **Steps 4.6–4.9 — Risk Scoring & Incident Persistence:** Multi-window correlation, composite risk scoring engine, entropy analysis, and relational SQLite incident persistence with cryptographic chaining. *(Next Step)*
 - **Phase 5 — Presentation & Integrity:** PySide6 desktop dashboard, incident timeline inspector, cryptographic hash chaining, and sandboxed test simulator.
 - **Phase 6 — Validation & Benchmark:** Labelled synthetic corpus validation, benign workload matrix evaluation, and empirical metric publishing.
 - **Phase 7 — Public Release:** Installer packaging, user guide, demonstration assets, and open-source release.
