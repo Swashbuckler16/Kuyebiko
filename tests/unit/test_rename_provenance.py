@@ -266,7 +266,6 @@ def test_repeated_and_duplicate_rename_pair_consistency():
         correlation_provenance="rename_correlator:src.txt->target.txt",
         monotonic_ns=base_ns,
     )
-    # Same event object re-added (or identical paths)
     e2 = _make_event(
         event_id="r2",
         file_path="target2.txt",
@@ -289,3 +288,148 @@ def test_repeated_and_duplicate_rename_pair_consistency():
     stats_pruned = window.get_aggregate_stats()
     assert stats_pruned.rename_pairs_count == 0
     assert stats_pruned.renamed_count == 0
+
+
+def test_duplicate_event_delivery_rejection():
+    """Replaying the exact same event ID must not artificially inflate rename stats."""
+    window = RootSlidingWindow(root_id="root-1", window_duration_seconds=10.0)
+    base_ns = 1_000_000_000
+
+    e1 = _make_event(
+        event_id="r_dup_1",
+        file_path="file.locked",
+        event_type=EventType.RENAMED,
+        old_path="file.txt",
+        new_path="file.locked",
+        correlation_provenance="rename_correlator:file.txt->file.locked",
+        monotonic_ns=base_ns,
+    )
+
+    # Initial delivery
+    window.add_event(e1)
+    assert len(window.get_events()) == 1
+    assert window.get_aggregate_stats().rename_pairs_count == 1
+    assert window.get_aggregate_stats().renamed_count == 1
+
+    # Replay identical event with same event_id
+    window.add_event(e1)
+    assert len(window.get_events()) == 1
+    assert window.get_aggregate_stats().rename_pairs_count == 1
+    assert window.get_aggregate_stats().renamed_count == 1
+
+
+def test_legitimate_repeated_renames_distinguished():
+    """Legitimate repeated renames of the same file are distinguished and tracked."""
+    window = RootSlidingWindow(root_id="root-1", window_duration_seconds=10.0)
+    base_ns = 1_000_000_000
+
+    # Step 1: file.txt -> file.tmp (first rename)
+    e1 = _make_event(
+        event_id="r_step_1",
+        file_path="file.tmp",
+        event_type=EventType.RENAMED,
+        old_path="file.txt",
+        new_path="file.tmp",
+        correlation_provenance="rename_correlator:file.txt->file.tmp",
+        monotonic_ns=base_ns,
+    )
+    # Step 2: file.tmp -> file.locked (second sequential rename of the same resource)
+    e2 = _make_event(
+        event_id="r_step_2",
+        file_path="file.locked",
+        event_type=EventType.RENAMED,
+        old_path="file.tmp",
+        new_path="file.locked",
+        correlation_provenance="rename_correlator:file.tmp->file.locked",
+        monotonic_ns=base_ns + 100_000_000,
+    )
+
+    window.add_event(e1)
+    window.add_event(e2)
+
+    events = window.get_events()
+    assert len(events) == 2
+    assert window.get_aggregate_stats().rename_pairs_count == 2
+    assert window.get_aggregate_stats().renamed_count == 2
+
+
+def test_explicit_pair_provenance_rejected_by_detection():
+    """Explicitly supplied pairs do not count as correlated Phase 3 renames."""
+    evaluator = RenameRatioSignalEvaluator(threshold=0.60, min_renames=5, min_events=10)
+    base_ns = 1_000_000_000
+
+    # 10 rename events with explicit_pair provenance (e.g. unverified input)
+    events = [
+        _make_event(
+            event_id=f"exp_{i}",
+            file_path=f"file_{i}.locked",
+            event_type=EventType.RENAMED,
+            old_path=f"file_{i}.txt",
+            new_path=f"file_{i}.locked",
+            correlation_provenance=f"explicit_pair:file_{i}.txt->file_{i}.locked",
+            monotonic_ns=base_ns + i * 1000,
+        )
+        for i in range(10)
+    ]
+
+    ctx = _make_context(events)
+    # Window aggregate stats must NOT count explicit_pair towards rename_pairs_count
+    assert ctx.stats.rename_pairs_count == 0
+    assert ctx.stats.renamed_count == 10
+
+    # Evaluator must NOT trigger
+    res = evaluator.evaluate(ctx)
+    assert res.triggered is False
+    assert res.observed_metric == 0.0
+    assert len(res.evidence_event_ids) == 0
+
+
+def test_simulator_provenance_accepted_by_detection():
+    """Simulator provenance is accepted for benchmark and simulation testing."""
+    evaluator = RenameRatioSignalEvaluator(threshold=0.60, min_renames=5, min_events=10)
+    base_ns = 1_000_000_000
+
+    events = [
+        _make_event(
+            event_id=f"sim_{i}",
+            file_path=f"file_{i}.locked",
+            event_type=EventType.RENAMED,
+            old_path=f"file_{i}.txt",
+            new_path=f"file_{i}.locked",
+            correlation_provenance=f"simulator:batch_sim_{i}",
+            monotonic_ns=base_ns + i * 1000,
+        )
+        for i in range(10)
+    ]
+
+    ctx = _make_context(events)
+    assert ctx.stats.rename_pairs_count == 10
+    res = evaluator.evaluate(ctx)
+    assert res.triggered is True
+    assert res.observed_metric == 1.0
+
+
+def test_forged_or_invalid_provenance_rejected():
+    """Arbitrary/forged provenance strings are rejected at model validation time."""
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="Invalid correlation_provenance type"):
+        _make_event(
+            event_id="forged_1",
+            file_path="f.locked",
+            event_type=EventType.RENAMED,
+            old_path="f.txt",
+            new_path="f.locked",
+            correlation_provenance="admin_forgery:f.txt->f.locked",
+        )
+
+    with pytest.raises(ValidationError, match="correlation_provenance must follow"):
+        _make_event(
+            event_id="malformed_1",
+            file_path="f.locked",
+            event_type=EventType.RENAMED,
+            old_path="f.txt",
+            new_path="f.locked",
+            correlation_provenance="just_a_string_without_prefix",
+        )

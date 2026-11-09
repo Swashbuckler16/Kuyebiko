@@ -23,7 +23,12 @@ from datetime import UTC, datetime
 
 from kuyebiko.detection.context import DetectionContext
 from kuyebiko.detection.models import WindowAggregateStats
-from kuyebiko.models.events import EventType, FileEvent, TelemetryQuality
+from kuyebiko.models.events import (
+    EventType,
+    FileEvent,
+    TelemetryQuality,
+    is_approved_rename_provenance,
+)
 from kuyebiko.processing.ordering import EventOrderingMetadata
 
 logger = logging.getLogger("kuyebiko.detection.window")
@@ -70,6 +75,7 @@ class RootSlidingWindow:
         self._path_counts: Counter[str] = Counter()
         self._ext_counts: Counter[str] = Counter()
         self._dir_counts: Counter[str] = Counter()
+        self._active_event_ids: set[str] = set()
 
         # Capacity drop tracking with recovery: drops within active horizon
         self._capacity_drop_timestamps: deque[int] = deque()
@@ -146,6 +152,15 @@ class RootSlidingWindow:
             )
 
         with self._lock:
+            # Suppress duplicate delivery of identical event ID within active window
+            if event.event_id in self._active_event_ids:
+                logger.debug(
+                    "Duplicate event ID %s ignored in window for root %s",
+                    event.event_id,
+                    self._root_id,
+                )
+                return
+
             clock_ns = (
                 now_monotonic_ns if now_monotonic_ns is not None else event.monotonic_ns
             )
@@ -157,6 +172,8 @@ class RootSlidingWindow:
                 self._retrograde_drop_timestamps.append(clock_ns)
                 self._cumulative_retrograde_dropped += 1
                 return
+
+            self._active_event_ids.add(event.event_id)
 
             # Fast path (O(1) amortized): Chronological arrival
             if not self._timestamps or event.monotonic_ns >= self._timestamps[-1]:
@@ -218,6 +235,7 @@ class RootSlidingWindow:
         evicted_event = self._events.pop(0)
         self._ordering_meta.pop(0)
         self._timestamps.pop(0)
+        self._active_event_ids.discard(evicted_event.event_id)
         self._exclude_event_locked(evicted_event)
 
     def _include_event_locked(self, event: FileEvent) -> None:
@@ -235,7 +253,7 @@ class RootSlidingWindow:
                     and event.old_path
                     and event.new_path
                     and event.old_path != event.new_path
-                    and event.correlation_provenance is not None
+                    and is_approved_rename_provenance(event.correlation_provenance)
                 ):
                     self._rename_pairs_count += 1
 
@@ -267,7 +285,7 @@ class RootSlidingWindow:
                     and event.old_path
                     and event.new_path
                     and event.old_path != event.new_path
-                    and event.correlation_provenance is not None
+                    and is_approved_rename_provenance(event.correlation_provenance)
                 ):
                     self._rename_pairs_count = max(0, self._rename_pairs_count - 1)
 
@@ -338,6 +356,7 @@ class RootSlidingWindow:
             self._events.clear()
             self._ordering_meta.clear()
             self._timestamps.clear()
+            self._active_event_ids.clear()
             self._created_count = 0
             self._modified_count = 0
             self._deleted_count = 0

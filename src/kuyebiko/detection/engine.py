@@ -19,12 +19,20 @@ from kuyebiko.detection.models import (
 )
 from kuyebiko.detection.registry import SignalRegistry
 from kuyebiko.detection.signals.burst_write import BurstWriteSignalEvaluator
+from kuyebiko.detection.signals.data_destruction import DataDestructionSignalEvaluator
 from kuyebiko.detection.signals.delete_ratio import DeleteRatioSignalEvaluator
 from kuyebiko.detection.signals.directory_traversal import (
     DirectoryTraversalSignalEvaluator,
 )
 from kuyebiko.detection.signals.extension_convergence import (
     ExtensionConvergenceSignalEvaluator,
+)
+from kuyebiko.detection.signals.filesystem_discovery import (
+    FilesystemDiscoverySignalEvaluator,
+)
+from kuyebiko.detection.signals.indicator_removal import IndicatorRemovalSignalEvaluator
+from kuyebiko.detection.signals.recovery_inhibition import (
+    RecoveryInhibitionSignalEvaluator,
 )
 from kuyebiko.detection.signals.rename_ratio import RenameRatioSignalEvaluator
 from kuyebiko.detection.window import SlidingWindowCorrelator
@@ -108,6 +116,20 @@ class DetectionEngine(EventConsumer):
             DeleteRatioSignalEvaluator(),
             DirectoryTraversalSignalEvaluator(),
             ExtensionConvergenceSignalEvaluator(),
+        ]
+        for sig in signals:
+            try:
+                self._registry.register(sig)
+            except ValueError:
+                pass  # already registered
+
+    def register_advanced_signals(self) -> None:
+        """Register the Phase 5 advanced ransomware behavioural signals."""
+        signals = [
+            RecoveryInhibitionSignalEvaluator(),
+            DataDestructionSignalEvaluator(),
+            FilesystemDiscoverySignalEvaluator(),
+            IndicatorRemovalSignalEvaluator(),
         ]
         for sig in signals:
             try:

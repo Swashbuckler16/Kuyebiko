@@ -3,7 +3,7 @@
 from kuyebiko.detection.context import DetectionContext
 from kuyebiko.detection.models import SignalFamily, SignalResult
 from kuyebiko.detection.signals.base import BaseSignalEvaluator
-from kuyebiko.models.events import EventType
+from kuyebiko.models.events import EventType, is_approved_rename_provenance
 
 
 class RenameRatioSignalEvaluator(BaseSignalEvaluator):
@@ -94,8 +94,8 @@ class RenameRatioSignalEvaluator(BaseSignalEvaluator):
         for e in context.events:
             if e.event_type != EventType.RENAMED or e.is_directory:
                 continue
-            # Enforce explicit rename correlation provenance
-            if not e.correlation_provenance:
+            # Enforce explicit approved rename correlation provenance
+            if not is_approved_rename_provenance(e.correlation_provenance):
                 continue
             if not e.old_path or not e.new_path:
                 continue

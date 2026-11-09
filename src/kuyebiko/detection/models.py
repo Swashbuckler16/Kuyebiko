@@ -22,6 +22,9 @@ class SignalFamily(StrEnum):
     RECOVERY_INTERFERENCE = "recovery_interference"
     CANARY_INTERACTION = "canary_interaction"
     PROCESS_ATTRIBUTION = "process_attribution"
+    DATA_DESTRUCTION = "data_destruction"
+    FILESYSTEM_DISCOVERY = "filesystem_discovery"
+    INDICATOR_REMOVAL = "indicator_removal"
 
 
 class DetectionOutcome(StrEnum):

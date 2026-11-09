@@ -149,3 +149,40 @@ All internal degradation sources feature deterministic, time-bounded recovery po
 3. **Adaptive Path Sorting:** For window sizes exceeding 200 paths, expensive full string sorting is bypassed in favor of O(n) key retrieval, eliminating CPU bottlenecks during sustained high-event bursts.
 4. **Precomputed Directory Diversity:** `FS_DIRECTORY_TRAVERSAL` evaluates directory branch diversity directly from precomputed window statistics (`stats.unique_directories`), avoiding full-window event iteration.
 
+---
+
+## 9. Phase 5: Advanced Behavioural Detection Modules
+
+Phase 5 extends Kuyebiko beyond its five foundational signals by incorporating MITRE ATT&CK-aligned behaviour modules with explicit telemetry capability contracts.
+
+### 9.1 Telemetry Capability Architecture & Boundaries
+A fundamental principle of Kuyebiko's advanced detection is separating **what can be observed** from **what the engine attempts to detect**:
+- `TelemetryCapability.FILESYSTEM_METADATA`: Standard Windows change notifications (`ReadDirectoryChangesW`).
+- `TelemetryCapability.PROCESS_EXECUTION`: Process creation and command-line execution (e.g., `vssadmin`, `wbadmin`, `wevtutil`).
+- `TelemetryCapability.EVENT_LOG`: Windows Event Log channels (e.g., Security Event ID 1102 / System Event ID 104).
+- `TelemetryCapability.FILESYSTEM_READ_ACCESS`: File read operations and directory enumeration (requires filter driver or dedicated read tracing).
+
+**Explicit Capability Enforcement:** If an advanced signal requires capabilities not available in the current environment or context, the evaluator automatically returns `triggered = False`, `severity = 0.0`, and records explicit `capability_limitation` metadata. Missing telemetry never fabricates a false detection or false safety claim.
+
+### 9.2 Advanced Evaluator Modules (Steps 5.2 – 5.5)
+1. **`FS_RECOVERY_INHIBITION` (MITRE ATT&CK T1490):**
+   - Family: `SignalFamily.RECOVERY_INTERFERENCE`.
+   - Filesystem observables: Deletion or destructive modification of recovery images, VSS shadow copy storage, backup catalogs (`.vhd`, `.vhdx`, `.bkf`, `.wbcat`, `System Volume Information`, `WindowsImageBackup`).
+   - Extended observables: Correlates command-line executions (`vssadmin delete shadows`, `wbadmin delete catalog`, `bcdedit /set ... recoveryenabled no`).
+   - Capability boundary: If process telemetry is absent, records explicit limitation while reliably inspecting recovery filesystem paths.
+2. **`FS_DATA_DESTRUCTION` (MITRE ATT&CK T1485):**
+   - Family: `SignalFamily.DATA_DESTRUCTION`.
+   - Distinct from `FS_DELETE_RATIO`: Requires substantial deletion volume across multiple distinct directory branches (`unique_directories >= 3`).
+   - Benign cleanup isolation: Mass deletions strictly confined to temporary or build directories (`temp`, `tmp`, `node_modules`, `target`, `build`, `.cache`) are recognized as benign cleanups and do not trigger destructive alarms.
+3. **`FS_FILESYSTEM_DISCOVERY` (MITRE ATT&CK T1083):**
+   - Family: `SignalFamily.FILESYSTEM_DISCOVERY`.
+   - Strictly declares `FILESYSTEM_READ_ACCESS` capability requirement.
+   - Change notifications (`ReadDirectoryChangesW`) cannot observe directory enumeration; when operating without dedicated read-access telemetry, the evaluator documents this capability limitation.
+   - When read-access telemetry is provided, detects high-velocity enumeration across directories while recognizing benign indexers (`SearchIndexer.exe`, `explorer.exe`).
+4. **`FS_INDICATOR_REMOVAL` (MITRE ATT&CK T1070):**
+   - Family: `SignalFamily.INDICATOR_REMOVAL`.
+   - Detects direct deletion of primary event logs (`winevt/Logs/Security.evtx`, `System.evtx`), NTFS USN journals (`$LogFile`, `$UsnJrnl`), or local forensic databases (`kuyebiko.db`).
+   - Correlates with event log clearing records (Event 1102 / 104) and process commands (`wevtutil cl`).
+   - Distinguishes standard archival log rotation (`Archive-*.evtx`) from hostile indicator tampering.
+
+

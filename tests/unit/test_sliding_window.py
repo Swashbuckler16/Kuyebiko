@@ -2,6 +2,7 @@
 
 import time
 from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
 
@@ -18,10 +19,10 @@ def _make_event(
     old_path: str | None = None,
     new_path: str | None = None,
     is_directory: bool = False,
-    event_id: str = "evt-1",
+    event_id: str | None = None,
 ) -> FileEvent:
     kwargs = {
-        "event_id": event_id,
+        "event_id": event_id or str(uuid4()),
         "root_id": root_id,
         "file_path": file_path,
         "event_type": event_type,

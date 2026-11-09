@@ -12,6 +12,29 @@ class EventType(StrEnum):
     DELETED = "deleted"
 
 
+class CorrelationProvenanceType(StrEnum):
+    """Origin classification for rename correlation evidence."""
+
+    PHASE3_CORRELATOR = "phase3_correlator"
+    RENAME_CORRELATOR = "rename_correlator"  # Backward-compatible alias
+    SIMULATOR = "simulator"
+    EXPLICIT_PAIR = "explicit_pair"
+    UNTRUSTED = "untrusted"
+
+
+def is_approved_rename_provenance(provenance: str | None) -> bool:
+    """Return True if provenance originates from a trusted correlator or simulator."""
+    if not provenance:
+        return False
+    return provenance.startswith(
+        (
+            f"{CorrelationProvenanceType.PHASE3_CORRELATOR}:",
+            f"{CorrelationProvenanceType.RENAME_CORRELATOR}:",
+            f"{CorrelationProvenanceType.SIMULATOR}:",
+        )
+    )
+
+
 class EventSource(StrEnum):
     WINDOWS_WATCHER = "windows_watcher"
     SYSMON = "sysmon"
@@ -86,6 +109,27 @@ class FileEvent(BaseModel):
             raise ValueError("File path cannot be empty")
 
         return normalized
+
+    @field_validator("correlation_provenance")
+    @classmethod
+    def validate_correlation_provenance(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if ":" not in value:
+            raise ValueError(
+                "correlation_provenance must follow the format "
+                "'<provenance_type>:<details>'"
+            )
+        prefix, _ = value.split(":", 1)
+        valid_prefixes = {t.value for t in CorrelationProvenanceType}
+        if prefix not in valid_prefixes:
+            allowed = sorted(valid_prefixes)
+            msg = (
+                f"Invalid correlation_provenance type '{prefix}'. "
+                f"Must be one of {allowed}"
+            )
+            raise ValueError(msg)
+        return value
 
     @model_validator(mode="after")
     def validate_rename_paths(self):
