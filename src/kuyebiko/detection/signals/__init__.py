@@ -13,7 +13,11 @@ from kuyebiko.detection.signals.extension_convergence import (
 from kuyebiko.detection.signals.filesystem_discovery import (
     FilesystemDiscoverySignalEvaluator,
 )
+from kuyebiko.detection.signals.in_place_transformation import (
+    InPlaceTransformationSignalEvaluator,
+)
 from kuyebiko.detection.signals.indicator_removal import IndicatorRemovalSignalEvaluator
+from kuyebiko.detection.signals.low_and_slow import LowAndSlowSignalEvaluator
 from kuyebiko.detection.signals.recovery_inhibition import (
     RecoveryInhibitionSignalEvaluator,
 )
@@ -27,7 +31,9 @@ __all__ = [
     "DirectoryTraversalSignalEvaluator",
     "ExtensionConvergenceSignalEvaluator",
     "FilesystemDiscoverySignalEvaluator",
+    "InPlaceTransformationSignalEvaluator",
     "IndicatorRemovalSignalEvaluator",
+    "LowAndSlowSignalEvaluator",
     "RecoveryInhibitionSignalEvaluator",
     "RenameRatioSignalEvaluator",
 ]

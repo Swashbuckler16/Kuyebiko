@@ -9,10 +9,12 @@ from kuyebiko.collectors.rename_correlator import (
 )
 from kuyebiko.core.exceptions import NormalizationError
 from kuyebiko.models.events import (
+    CorrelationProvenanceType,
     EventSource,
     EventType,
     FileEvent,
     TelemetryQuality,
+    sign_provenance_payload,
 )
 
 logger = logging.getLogger("kuyebiko.collectors.normalizer")
@@ -161,8 +163,10 @@ class EventNormalizer:
                 source=self._source,
                 sequence_number=seq,
                 quality=quality,
-                correlation_provenance=(
-                    f"rename_correlator:{correlated.old_path}->{correlated.new_path}"
+                correlation_provenance=sign_provenance_payload(
+                    CorrelationProvenanceType.PHASE3_CORRELATOR,
+                    correlated.old_path,
+                    correlated.new_path,
                 ),
             )
         except Exception as err:

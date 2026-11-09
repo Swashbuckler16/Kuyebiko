@@ -36,6 +36,8 @@ def _make_context(
     events: list[FileEvent],
     event_log_events: list[EventLogTelemetryEvent] | None = None,
     process_events: list[ProcessTelemetryEvent] | None = None,
+    available_capabilities: set[TelemetryCapability] | None = None,
+    evaluated_monotonic_ns: int | None = None,
 ) -> DetectionContext:
     now = datetime.now(UTC)
     config = {}
@@ -43,6 +45,8 @@ def _make_context(
         config["event_log_events"] = event_log_events
     if process_events is not None:
         config["process_events"] = process_events
+    if available_capabilities is not None:
+        config["available_capabilities"] = available_capabilities
 
     stats = WindowAggregateStats(
         total_events=len(events),
@@ -59,11 +63,17 @@ def _make_context(
         window_duration_seconds=10.0,
     )
 
+    eval_mono = (
+        evaluated_monotonic_ns
+        if evaluated_monotonic_ns is not None
+        else time.monotonic_ns()
+    )
+
     return DetectionContext(
         root_id="root-1",
         events=events,
         stats=stats,
-        evaluated_monotonic_ns=time.monotonic_ns(),
+        evaluated_monotonic_ns=eval_mono,
         window_start_utc=now,
         window_end_utc=now,
         window_duration_seconds=10.0,
@@ -118,6 +128,7 @@ def test_journal_and_database_deletion_triggers():
 def test_event_log_cleared_telemetry_triggers():
     """Windows Event 1102 (audit log cleared) triggers with highest severity."""
     evaluator = IndicatorRemovalSignalEvaluator(threshold=1.0)
+    now_ns = 10_000_000_000
     event_logs = [
         EventLogTelemetryEvent(
             root_id="root-1",
@@ -125,36 +136,109 @@ def test_event_log_cleared_telemetry_triggers():
             channel="Security",
             event_code=1102,
             message="The audit log was cleared",
-            monotonic_ns=1_000_000,
+            monotonic_ns=now_ns - 1_000_000_000,
         )
     ]
-    ctx = _make_context(events=[], event_log_events=event_logs)
+    ctx = _make_context(
+        events=[],
+        event_log_events=event_logs,
+        available_capabilities={
+            TelemetryCapability.FILESYSTEM_METADATA,
+            TelemetryCapability.EVENT_LOG,
+        },
+        evaluated_monotonic_ns=now_ns,
+    )
 
     res = evaluator.evaluate(ctx)
     assert res.triggered is True
     assert res.severity_score == 0.95
     assert res.observed_metric == 1.0
     assert "Event ID [1102]" in res.explanation
+    assert res.metadata["telemetry_state"]["event_log"] == "evidence_observed"
 
 
 def test_wevtutil_command_execution_triggers():
     """Execution of wevtutil cl System command triggers T1070."""
     evaluator = IndicatorRemovalSignalEvaluator(threshold=1.0)
+    now_ns = 10_000_000_000
     proc_events = [
         ProcessTelemetryEvent(
             root_id="root-1",
             process_id=3344,
             process_name="wevtutil.exe",
             command_line="wevtutil.exe cl System",
-            monotonic_ns=1_000_000,
+            monotonic_ns=now_ns - 1_000_000_000,
         )
     ]
-    ctx = _make_context(events=[], process_events=proc_events)
+    ctx = _make_context(
+        events=[],
+        process_events=proc_events,
+        available_capabilities={
+            TelemetryCapability.FILESYSTEM_METADATA,
+            TelemetryCapability.PROCESS_EXECUTION,
+        },
+        evaluated_monotonic_ns=now_ns,
+    )
 
     res = evaluator.evaluate(ctx)
     assert res.triggered is True
     assert res.observed_metric == 1.0
     assert "wevtutil.exe" in res.explanation
+    assert res.metadata["telemetry_state"]["process_execution"] == "evidence_observed"
+
+
+def test_event_log_unmonitored_when_capability_missing():
+    """When EVENT_LOG capability is missing, events are ignored and unmonitored."""
+    evaluator = IndicatorRemovalSignalEvaluator(threshold=1.0)
+    now_ns = 10_000_000_000
+    event_logs = [
+        EventLogTelemetryEvent(
+            root_id="root-1",
+            provider_name="Microsoft-Windows-Security-Auditing",
+            channel="Security",
+            event_code=1102,
+            message="The audit log was cleared",
+            monotonic_ns=now_ns - 1_000_000_000,
+        )
+    ]
+    # No EVENT_LOG capability
+    ctx = _make_context(
+        events=[],
+        event_log_events=event_logs,
+        available_capabilities={TelemetryCapability.FILESYSTEM_METADATA},
+        evaluated_monotonic_ns=now_ns,
+    )
+    res = evaluator.evaluate(ctx)
+    assert res.triggered is False
+    assert res.metadata["telemetry_state"]["event_log"] == "unavailable"
+
+
+def test_cross_root_event_log_rejected():
+    """Event log from an unrelated root is rejected."""
+    evaluator = IndicatorRemovalSignalEvaluator(threshold=1.0)
+    now_ns = 10_000_000_000
+    event_logs = [
+        EventLogTelemetryEvent(
+            root_id="foreign-root",
+            provider_name="Microsoft-Windows-Security-Auditing",
+            channel="Security",
+            event_code=1102,
+            message="The audit log was cleared",
+            monotonic_ns=now_ns - 1_000_000_000,
+        )
+    ]
+    ctx = _make_context(
+        events=[],
+        event_log_events=event_logs,
+        available_capabilities={
+            TelemetryCapability.FILESYSTEM_METADATA,
+            TelemetryCapability.EVENT_LOG,
+        },
+        evaluated_monotonic_ns=now_ns,
+    )
+    res = evaluator.evaluate(ctx)
+    assert res.triggered is False
+    assert res.metadata["rejected_auxiliary_events_count"] == 1
 
 
 def test_benign_archive_rotation_does_not_trigger():

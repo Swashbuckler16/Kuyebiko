@@ -62,6 +62,10 @@ class IndicatorRemovalSignalEvaluator(AdvancedSignalEvaluator):
                 "traces, and clearing of security event logs."
             ),
             required_capabilities=[TelemetryCapability.FILESYSTEM_METADATA],
+            optional_capabilities=[
+                TelemetryCapability.EVENT_LOG,
+                TelemetryCapability.PROCESS_EXECUTION,
+            ],
             evidence_requirements=(
                 "Deletion of critical .evtx files, USN journals, event log clear "
                 "events (Event ID 1102/104), or execution of wevtutil cl."
@@ -103,27 +107,45 @@ class IndicatorRemovalSignalEvaluator(AdvancedSignalEvaluator):
 
         fs_tampering_count = len(evidence_events)
 
-        # 2. Check optional Windows Event Log telemetry
-        event_log_events: list[EventLogTelemetryEvent] = context.config.get(
-            "event_log_events", []
+        # 2. Check Windows Event Log telemetry if capability is available
+        event_log_cap_available = self.is_capability_available(
+            TelemetryCapability.EVENT_LOG, context
         )
         matched_event_logs: list[EventLogTelemetryEvent] = []
-        for el in event_log_events:
-            if el.event_code in _CRITICAL_EVENT_CODES:
-                matched_event_logs.append(el)
+        rejected_event_logs: list[dict[str, Any]] = []
+
+        if event_log_cap_available:
+            raw_event_logs: list[EventLogTelemetryEvent] = context.config.get(
+                "event_log_events", []
+            )
+            scoped_el, rejected_event_logs = self.scope_auxiliary_telemetry(
+                raw_event_logs, context
+            )
+            for el in scoped_el:
+                if el.event_code in _CRITICAL_EVENT_CODES:
+                    matched_event_logs.append(el)
 
         event_log_count = len(matched_event_logs)
 
-        # 3. Check optional Process execution telemetry (wevtutil)
-        proc_events: list[ProcessTelemetryEvent] = context.config.get(
-            "process_events", []
+        # 3. Check Process execution telemetry if capability is available
+        proc_cap_available = self.is_capability_available(
+            TelemetryCapability.PROCESS_EXECUTION, context
         )
         matched_proc_commands: list[ProcessTelemetryEvent] = []
-        for pe in proc_events:
-            for pattern in _COMMAND_CLEAR_PATTERNS:
-                if pattern.search(pe.command_line):
-                    matched_proc_commands.append(pe)
-                    break
+        rejected_procs: list[dict[str, Any]] = []
+
+        if proc_cap_available:
+            raw_proc: list[ProcessTelemetryEvent] = context.config.get(
+                "process_events", []
+            )
+            scoped_proc, rejected_procs = self.scope_auxiliary_telemetry(
+                raw_proc, context
+            )
+            for pe in scoped_proc:
+                for pattern in _COMMAND_CLEAR_PATTERNS:
+                    if pattern.search(pe.command_line):
+                        matched_proc_commands.append(pe)
+                        break
 
         proc_cmd_count = len(matched_proc_commands)
         total_evidence_count = fs_tampering_count + event_log_count + proc_cmd_count
@@ -131,7 +153,6 @@ class IndicatorRemovalSignalEvaluator(AdvancedSignalEvaluator):
         triggered = total_evidence_count >= self.threshold
         severity = 0.0
         if triggered:
-            # Indicator removal is high severity
             severity = 0.85
             if event_log_count > 0 or fs_tampering_count > 1:
                 severity = 0.95
@@ -142,7 +163,7 @@ class IndicatorRemovalSignalEvaluator(AdvancedSignalEvaluator):
             + [pe.event_id for pe in matched_proc_commands]
         )
 
-        has_ext_telemetry = bool(event_log_events or proc_events)
+        has_ext_telemetry = bool(event_log_cap_available or proc_cap_available)
 
         if triggered:
             parts = []
@@ -170,11 +191,31 @@ class IndicatorRemovalSignalEvaluator(AdvancedSignalEvaluator):
                 "No observable indicator removal or security log tampering detected"
             )
 
+        telemetry_state = {
+            "filesystem_metadata": (
+                "evidence_observed" if fs_tampering_count > 0 else "clean"
+            ),
+            "event_log": (
+                ("evidence_observed" if event_log_count > 0 else "clean")
+                if event_log_cap_available
+                else "unavailable"
+            ),
+            "process_execution": (
+                ("evidence_observed" if proc_cmd_count > 0 else "clean")
+                if proc_cap_available
+                else "unavailable"
+            ),
+        }
+
+        total_rejected_aux = len(rejected_event_logs) + len(rejected_procs)
+
         metadata: dict[str, Any] = {
             "filesystem_tampering_count": fs_tampering_count,
             "event_log_clear_count": event_log_count,
             "process_clear_command_count": proc_cmd_count,
             "has_extended_telemetry": has_ext_telemetry,
+            "telemetry_state": telemetry_state,
+            "rejected_auxiliary_events_count": total_rejected_aux,
             "mitre_technique": "T1070",
         }
         if not has_ext_telemetry:

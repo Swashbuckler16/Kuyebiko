@@ -7,7 +7,13 @@ from uuid import uuid4
 import pytest
 
 from kuyebiko.detection.window import RootSlidingWindow, SlidingWindowCorrelator
-from kuyebiko.models.events import EventSource, EventType, FileEvent
+from kuyebiko.models.events import (
+    CorrelationProvenanceType,
+    EventSource,
+    EventType,
+    FileEvent,
+    sign_provenance_payload,
+)
 from kuyebiko.processing.ordering import EventOrderingMetadata
 
 
@@ -35,8 +41,10 @@ def _make_event(
     if event_type == EventType.RENAMED:
         kwargs["old_path"] = old_path or "dir/old.txt"
         kwargs["new_path"] = new_path or file_path
-        kwargs["correlation_provenance"] = (
-            f"rename_correlator:{kwargs['old_path']}->{kwargs['new_path']}"
+        kwargs["correlation_provenance"] = sign_provenance_payload(
+            CorrelationProvenanceType.PHASE3_CORRELATOR,
+            kwargs["old_path"],
+            kwargs["new_path"],
         )
     return FileEvent(**kwargs)
 

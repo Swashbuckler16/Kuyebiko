@@ -9,7 +9,17 @@ from kuyebiko.collectors.rename_correlator import RenameCorrelator
 from kuyebiko.detection.context import DetectionContext
 from kuyebiko.detection.signals.rename_ratio import RenameRatioSignalEvaluator
 from kuyebiko.detection.window import RootSlidingWindow
-from kuyebiko.models.events import EventSource, EventType, FileEvent
+from kuyebiko.models.events import (
+    CorrelationProvenanceType,
+    EventSource,
+    EventType,
+    FileEvent,
+    is_approved_rename_provenance,
+    sign_provenance_payload,
+    sign_simulator_provenance,
+)
+
+_DEFAULT = object()
 
 
 def _make_event(
@@ -19,7 +29,7 @@ def _make_event(
     old_path: str | None = None,
     new_path: str | None = None,
     is_directory: bool = False,
-    correlation_provenance: str | None = None,
+    correlation_provenance: object = _DEFAULT,
     monotonic_ns: int | None = None,
     event_id: str | None = None,
 ) -> FileEvent:
@@ -37,7 +47,14 @@ def _make_event(
     if event_type == EventType.RENAMED:
         kwargs["old_path"] = old_path or "old.txt"
         kwargs["new_path"] = new_path or file_path
-        kwargs["correlation_provenance"] = correlation_provenance
+        if correlation_provenance is _DEFAULT:
+            kwargs["correlation_provenance"] = sign_provenance_payload(
+                CorrelationProvenanceType.PHASE3_CORRELATOR,
+                kwargs["old_path"],
+                kwargs["new_path"],
+            )
+        else:
+            kwargs["correlation_provenance"] = correlation_provenance
     return FileEvent(**kwargs)
 
 
@@ -94,7 +111,8 @@ def test_correlated_rename_provenance_via_normalizer():
     assert ev_rename.old_path == "docs/draft.docx"
     assert ev_rename.new_path == "docs/draft.docx.locked"
     assert ev_rename.correlation_provenance is not None
-    assert "rename_correlator:docs/draft.docx->docs/draft.docx.locked" in (
+    assert is_approved_rename_provenance(ev_rename.correlation_provenance) is True
+    assert "phase3_correlator:docs/draft.docx->docs/draft.docx.locked" in (
         ev_rename.correlation_provenance
     )
 
@@ -214,7 +232,6 @@ def test_stats_discrepancy_detection_and_safeguard():
             event_type=EventType.RENAMED,
             old_path=f"file_{i}.txt",
             new_path=f"file_{i}.locked",
-            correlation_provenance=f"rename_correlator:file_{i}.txt->file_{i}.locked",
             monotonic_ns=base_ns + i * 1000,
         )
         for i in range(6)
@@ -263,7 +280,6 @@ def test_repeated_and_duplicate_rename_pair_consistency():
         event_type=EventType.RENAMED,
         old_path="src.txt",
         new_path="target.txt",
-        correlation_provenance="rename_correlator:src.txt->target.txt",
         monotonic_ns=base_ns,
     )
     e2 = _make_event(
@@ -272,7 +288,6 @@ def test_repeated_and_duplicate_rename_pair_consistency():
         event_type=EventType.RENAMED,
         old_path="src2.txt",
         new_path="target2.txt",
-        correlation_provenance="rename_correlator:src2.txt->target2.txt",
         monotonic_ns=base_ns + 1000,
     )
 
@@ -301,7 +316,6 @@ def test_duplicate_event_delivery_rejection():
         event_type=EventType.RENAMED,
         old_path="file.txt",
         new_path="file.locked",
-        correlation_provenance="rename_correlator:file.txt->file.locked",
         monotonic_ns=base_ns,
     )
 
@@ -330,7 +344,6 @@ def test_legitimate_repeated_renames_distinguished():
         event_type=EventType.RENAMED,
         old_path="file.txt",
         new_path="file.tmp",
-        correlation_provenance="rename_correlator:file.txt->file.tmp",
         monotonic_ns=base_ns,
     )
     # Step 2: file.tmp -> file.locked (second sequential rename of the same resource)
@@ -340,7 +353,6 @@ def test_legitimate_repeated_renames_distinguished():
         event_type=EventType.RENAMED,
         old_path="file.tmp",
         new_path="file.locked",
-        correlation_provenance="rename_correlator:file.tmp->file.locked",
         monotonic_ns=base_ns + 100_000_000,
     )
 
@@ -385,7 +397,7 @@ def test_explicit_pair_provenance_rejected_by_detection():
 
 
 def test_simulator_provenance_accepted_by_detection():
-    """Simulator provenance is accepted for benchmark and simulation testing."""
+    """Simulator provenance is accepted when properly signed by simulator generator."""
     evaluator = RenameRatioSignalEvaluator(threshold=0.60, min_renames=5, min_events=10)
     base_ns = 1_000_000_000
 
@@ -396,7 +408,7 @@ def test_simulator_provenance_accepted_by_detection():
             event_type=EventType.RENAMED,
             old_path=f"file_{i}.txt",
             new_path=f"file_{i}.locked",
-            correlation_provenance=f"simulator:batch_sim_{i}",
+            correlation_provenance=sign_simulator_provenance(f"batch_sim_{i}"),
             monotonic_ns=base_ns + i * 1000,
         )
         for i in range(10)
@@ -433,3 +445,73 @@ def test_forged_or_invalid_provenance_rejected():
             new_path="f.locked",
             correlation_provenance="just_a_string_without_prefix",
         )
+
+
+def test_forged_provenance_without_hmac_is_treated_as_untrusted():
+    """A caller supplying a trusted prefix without HMAC is rejected by detection."""
+    evaluator = RenameRatioSignalEvaluator(threshold=0.60, min_renames=5, min_events=10)
+    base_ns = 1_000_000_000
+
+    # Events carry prefix 'phase3_correlator:' but lack HMAC signature
+    events = [
+        _make_event(
+            event_id=f"forged_{i}",
+            file_path=f"file_{i}.locked",
+            event_type=EventType.RENAMED,
+            old_path=f"file_{i}.txt",
+            new_path=f"file_{i}.locked",
+            correlation_provenance=f"phase3_correlator:file_{i}.txt->file_{i}.locked",
+            monotonic_ns=base_ns + i * 1000,
+        )
+        for i in range(10)
+    ]
+
+    # Verify provenance signature check fails
+    for ev in events:
+        assert is_approved_rename_provenance(ev.correlation_provenance) is False
+
+    ctx = _make_context(events)
+    # Window does not increment rename_pairs_count for unauthenticated provenance
+    assert ctx.stats.rename_pairs_count == 0
+    assert ctx.stats.renamed_count == 10
+
+    res = evaluator.evaluate(ctx)
+    assert res.triggered is False
+    assert res.observed_metric == 0.0
+    assert len(res.evidence_event_ids) == 0
+
+
+def test_forged_provenance_with_tampered_hmac_rejected():
+    """An event with forged or modified HMAC signature is rejected."""
+    tampered = _make_event(
+        event_id="tampered_1",
+        file_path="doc.locked",
+        event_type=EventType.RENAMED,
+        old_path="doc.txt",
+        new_path="doc.locked",
+        correlation_provenance="phase3_correlator:doc.txt->doc.locked#badsignature1234",
+    )
+    assert is_approved_rename_provenance(tampered.correlation_provenance) is False
+
+
+def test_serialization_roundtrip_preserves_trust_and_detects_tampering():
+    """Serialization retains valid signatures; tampering with serialized data fails."""
+    ev = _make_event(
+        event_id="orig_1",
+        file_path="secret.locked",
+        event_type=EventType.RENAMED,
+        old_path="secret.docx",
+        new_path="secret.locked",
+    )
+    assert is_approved_rename_provenance(ev.correlation_provenance) is True
+
+    # Serialize to JSON and deserialize
+    serialized = ev.model_dump_json()
+    deserialized = FileEvent.model_validate_json(serialized)
+    assert is_approved_rename_provenance(deserialized.correlation_provenance) is True
+
+    # Tamper with the old_path in serialized JSON
+    tampered_json = serialized.replace("secret.docx", "other.docx")
+    ev_tampered = FileEvent.model_validate_json(tampered_json)
+    # Signature no longer matches the payload!
+    assert is_approved_rename_provenance(ev_tampered.correlation_provenance) is False

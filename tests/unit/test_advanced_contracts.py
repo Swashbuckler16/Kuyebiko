@@ -233,3 +233,77 @@ def test_telemetry_event_models():
         monotonic_ns=300_000,
     )
     assert disc.operation == "enumerate"
+
+
+def test_signal_metadata_optional_capabilities():
+    """Verify SignalMetadata correctly holds optional_capabilities."""
+    meta = SignalMetadata(
+        signal_id="SIG_OPT_TEST",
+        name="Optional Capabilities Test",
+        family=SignalFamily.RECOVERY_INTERFERENCE,
+        description="Testing optional capabilities",
+        required_capabilities=[TelemetryCapability.FILESYSTEM_METADATA],
+        optional_capabilities=[TelemetryCapability.PROCESS_EXECUTION],
+        evidence_requirements="Requirements",
+        confidence_limitations="Limitations",
+        threshold=1.0,
+        default_threshold=1.0,
+    )
+    assert meta.required_capabilities == [TelemetryCapability.FILESYSTEM_METADATA]
+    assert meta.optional_capabilities == [TelemetryCapability.PROCESS_EXECUTION]
+
+
+def test_advanced_evaluator_auxiliary_scoping():
+    """Verify scope_auxiliary_telemetry enforces root identity and window horizon."""
+    evaluator = _MockAdvancedEvaluator()
+    ctx = _make_context(
+        available_capabilities={
+            TelemetryCapability.FILESYSTEM_METADATA,
+            TelemetryCapability.PROCESS_EXECUTION,
+        }
+    )
+    ctx_offset = ctx.model_copy(
+        update={
+            "root_id": "root-target",
+            "evaluated_monotonic_ns": 20_000_000_000,
+            "window_duration_seconds": 5.0,  # window is 15s..20s
+        }
+    )
+    ev_inside = ProcessTelemetryEvent(
+        root_id="root-target",
+        process_id=1004,
+        process_name="inside.exe",
+        command_line="inside",
+        monotonic_ns=17_000_000_000,  # in [15s, 20s]
+    )
+    ev_cross_root = ProcessTelemetryEvent(
+        root_id="root-other",
+        process_id=1002,
+        process_name="proc2.exe",
+        command_line="proc2",
+        monotonic_ns=17_000_000_000,  # wrong root
+    )
+    ev_before = ProcessTelemetryEvent(
+        root_id="root-target",
+        process_id=1005,
+        process_name="before.exe",
+        command_line="before",
+        monotonic_ns=14_000_000_000,  # before 15s
+    )
+    ev_after = ProcessTelemetryEvent(
+        root_id="root-target",
+        process_id=1006,
+        process_name="after.exe",
+        command_line="after",
+        monotonic_ns=21_000_000_000,  # after 20s
+    )
+
+    events = [ev_inside, ev_cross_root, ev_before, ev_after]
+    scoped, rejected = evaluator.scope_auxiliary_telemetry(events, ctx_offset)
+
+    assert len(scoped) == 1
+    assert scoped[0].process_name == "inside.exe"
+    assert len(rejected) == 3
+    rejection_reasons = {r["reason"] for r in rejected}
+    assert "cross_root" in rejection_reasons
+    assert "out_of_window" in rejection_reasons

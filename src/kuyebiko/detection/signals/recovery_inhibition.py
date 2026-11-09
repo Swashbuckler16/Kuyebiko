@@ -20,22 +20,29 @@ from kuyebiko.detection.models import SignalFamily, SignalResult
 from kuyebiko.models.events import EventType
 
 # Known filesystem path patterns and extensions associated with Windows recovery
-_RECOVERY_PATH_PATTERNS = (
+_STRONG_RECOVERY_PATHS = (
     "system volume information",
     "windowsimagebackup",
     "recovery/windowsre",
-    "$recycle.bin",  # Often abused or cleared during inhibition
 )
 
-_RECOVERY_EXTENSIONS = {
-    ".vhd",
-    ".vhdx",
+_STRONG_RECOVERY_EXTENSIONS = {
     ".bkf",
     ".wbcat",
     ".vss",
     ".shadow",
     ".tib",  # Acronis backup
     ".vbk",  # Veeam backup
+}
+
+# Weak recovery indicators that routinely occur in non-attack scenarios
+_WEAK_RECOVERY_PATHS = (
+    "$recycle.bin",  # Routine desktop deletion / bin emptying
+)
+
+_WEAK_RECOVERY_EXTENSIONS = {
+    ".vhd",  # Routine virtual disk modifications
+    ".vhdx",
 }
 
 # Suspicious recovery command line regexes
@@ -71,13 +78,15 @@ class RecoveryInhibitionSignalEvaluator(AdvancedSignalEvaluator):
                 "shadow copy backups, or execution of recovery-disabling tools."
             ),
             required_capabilities=[TelemetryCapability.FILESYSTEM_METADATA],
+            optional_capabilities=[TelemetryCapability.PROCESS_EXECUTION],
             evidence_requirements=(
-                "Deletion/modification of recovery paths (.vhd, .bkf, "
+                "Deletion/modification of recovery paths (.bkf, .wbcat, "
                 "WindowsImageBackup, System Volume Information) or process execution."
             ),
             confidence_limitations=(
                 "Filesystem notifications alone cannot verify command-line arguments; "
-                "full process attribution requires PROCESS_EXECUTION capability."
+                "full process attribution requires PROCESS_EXECUTION capability. "
+                "Weak indicators (.vhd, $Recycle.Bin) require strong corroboration."
             ),
             threshold=threshold,
             default_threshold=1.0,
@@ -87,7 +96,9 @@ class RecoveryInhibitionSignalEvaluator(AdvancedSignalEvaluator):
 
     def evaluate_advanced(self, context: DetectionContext) -> SignalResult:
         """Evaluate filesystem mutations and optional process telemetry."""
-        recovery_events = []
+        strong_recovery_events = []
+        weak_recovery_events = []
+
         for e in context.events:
             # We look for destructive actions on recovery artifacts
             if e.event_type not in (EventType.DELETED, EventType.MODIFIED):
@@ -96,30 +107,34 @@ class RecoveryInhibitionSignalEvaluator(AdvancedSignalEvaluator):
             path_norm = e.file_path.lower().replace("\\", "/")
             _, ext = posixpath.splitext(path_norm)
 
-            is_recovery_target = False
-            if ext in _RECOVERY_EXTENSIONS:
-                is_recovery_target = True
-            elif any(pat in path_norm for pat in _RECOVERY_PATH_PATTERNS):
-                is_recovery_target = True
+            if ext in _STRONG_RECOVERY_EXTENSIONS or any(
+                pat in path_norm for pat in _STRONG_RECOVERY_PATHS
+            ):
+                strong_recovery_events.append(e)
+            elif ext in _WEAK_RECOVERY_EXTENSIONS or any(
+                pat in path_norm for pat in _WEAK_RECOVERY_PATHS
+            ):
+                weak_recovery_events.append(e)
 
-            if is_recovery_target:
-                recovery_events.append(e)
+        strong_fs_count = len(strong_recovery_events)
+        weak_fs_count = len(weak_recovery_events)
 
-        fs_count = len(recovery_events)
-
-        # Process optional process execution telemetry
-        proc_telemetry: list[ProcessTelemetryEvent] = context.config.get(
-            "process_events", []
-        )
-        proc_telemetry_available = bool(
-            TelemetryCapability.PROCESS_EXECUTION
-            in context.config.get("available_capabilities", set())
-            or proc_telemetry
+        # Process execution telemetry strictly if capability is available
+        proc_telemetry_available = self.is_capability_available(
+            TelemetryCapability.PROCESS_EXECUTION, context
         )
 
         matched_commands: list[dict[str, Any]] = []
-        if proc_telemetry:
-            for p in proc_telemetry:
+        rejected_proc: list[dict[str, Any]] = []
+
+        if proc_telemetry_available:
+            raw_proc: list[ProcessTelemetryEvent] = context.config.get(
+                "process_events", []
+            )
+            scoped_proc, rejected_proc = self.scope_auxiliary_telemetry(
+                raw_proc, context
+            )
+            for p in scoped_proc:
                 cmd = p.command_line
                 for pattern in _RECOVERY_COMMAND_PATTERNS:
                     if pattern.search(cmd):
@@ -133,26 +148,43 @@ class RecoveryInhibitionSignalEvaluator(AdvancedSignalEvaluator):
                         break
 
         proc_count = len(matched_commands)
-        total_evidence_count = fs_count + proc_count
+        strong_evidence_count = strong_fs_count + proc_count
 
-        triggered = total_evidence_count >= self.threshold
-        severity = 0.0
-        if triggered:
-            # High severity for recovery inhibition
+        # Weak indicators must NOT trigger on their own
+        if strong_evidence_count >= self.threshold:
+            triggered = True
             severity = 0.85 if proc_count > 0 else 0.70
-            if fs_count > 3:
+            if strong_fs_count > 3:
                 severity = min(1.0, severity + 0.15)
+        elif strong_evidence_count == 0 and weak_fs_count >= 5:
+            # Elevated weak indicators can trigger with heavy discount
+            triggered = True
+            severity = 0.40
+        else:
+            triggered = False
+            severity = 0.0
 
-        evidence_ids = [e.event_id for e in recovery_events] + [
-            m["event_id"] for m in matched_commands
-        ]
+        total_evidence_count = strong_evidence_count + (
+            weak_fs_count if triggered else 0
+        )
+
+        evidence_ids = (
+            [e.event_id for e in strong_recovery_events]
+            + [e.event_id for e in weak_recovery_events if triggered]
+            + [m["event_id"] for m in matched_commands]
+        )
 
         if triggered:
             details = []
-            if fs_count > 0:
+            if strong_fs_count > 0:
                 details.append(
-                    f"{fs_count} recovery filesystem mutations "
-                    f"([e.g. {recovery_events[0].file_path}])"
+                    f"{strong_fs_count} strong recovery filesystem mutations "
+                    f"([e.g. {strong_recovery_events[0].file_path}])"
+                )
+            if weak_fs_count > 0:
+                details.append(
+                    f"{weak_fs_count} weak recovery indicators "
+                    f"([e.g. {weak_recovery_events[0].file_path}])"
                 )
             if proc_count > 0:
                 details.append(
@@ -167,10 +199,27 @@ class RecoveryInhibitionSignalEvaluator(AdvancedSignalEvaluator):
                 "No observable recovery inhibition activity detected in window"
             )
 
+        telemetry_state = {
+            "filesystem_metadata": (
+                "evidence_observed"
+                if (strong_fs_count + weak_fs_count) > 0
+                else "clean"
+            ),
+            "process_execution": (
+                ("evidence_observed" if proc_count > 0 else "clean")
+                if proc_telemetry_available
+                else "unavailable"
+            ),
+        }
+
         metadata: dict[str, Any] = {
-            "recovery_filesystem_events": fs_count,
+            "recovery_filesystem_events": strong_fs_count + weak_fs_count,
+            "strong_recovery_events": strong_fs_count,
+            "weak_recovery_events": weak_fs_count,
             "recovery_command_events": proc_count,
             "process_telemetry_available": proc_telemetry_available,
+            "telemetry_state": telemetry_state,
+            "rejected_auxiliary_events_count": len(rejected_proc),
             "mitre_technique": "T1490",
         }
         if not proc_telemetry_available:

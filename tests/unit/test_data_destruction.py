@@ -139,3 +139,52 @@ def test_insufficient_deletion_volume_does_not_trigger():
 
     assert res.triggered is False
     assert "Insufficient events (3)" in res.explanation
+
+
+def test_massive_cache_burst_triggers_despite_temp_naming():
+    """Massive deletion burst (50 files across 5 temp subdirs) triggers T1485."""
+    evaluator = DataDestructionSignalEvaluator(
+        min_deletions=15, min_directories=3, threshold=0.50
+    )
+    events = []
+    # 50 deletions across 5 temp subdirectories
+    for i in range(50):
+        subdir = f"temp/cache_shard_{i % 5}"
+        events.append(_make_event(f"{subdir}/file_{i}.tmp"))
+
+    ctx = _make_context(events)
+    res = evaluator.evaluate(ctx)
+
+    assert res.triggered is True
+    assert res.metadata["is_confined_to_temp"] is True
+    assert res.metadata["is_massive_burst"] is True
+    assert res.metadata["unique_directories_count"] == 5
+    assert res.metadata["deleted_count"] == 50
+    assert (
+        "Massive data destruction burst detected in cache/temp structures"
+        in res.explanation
+    )
+
+
+def test_mixed_workload_triggers_without_veto_from_temp():
+    """Mixed workload with user document deletions is not vetoed by temp deletions."""
+    evaluator = DataDestructionSignalEvaluator(
+        min_deletions=15, min_directories=3, threshold=0.50
+    )
+    events = []
+    # 20 deletions in user documents across 4 folders
+    for i in range(20):
+        events.append(_make_event(f"users/docs_{i % 4}/important_{i}.pdf"))
+    # 10 deletions in temp
+    for i in range(10):
+        events.append(_make_event(f"temp/scratch/item_{i}.tmp"))
+
+    ctx = _make_context(events)
+    res = evaluator.evaluate(ctx)
+
+    assert res.triggered is True
+    assert res.metadata["is_confined_to_temp"] is False
+    assert res.metadata["non_benign_deleted_count"] == 20
+    assert res.metadata["non_benign_directories_count"] == 4
+    assert res.observed_metric == 1.0  # all events are deletions
+    assert "Mass data destruction detected (T1485)" in res.explanation

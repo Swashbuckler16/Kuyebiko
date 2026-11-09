@@ -8,6 +8,7 @@ explicit capability limitations rather than fabricated positive/negative claims.
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Any, TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -39,6 +40,7 @@ class SignalMetadata(BaseModel):
     required_capabilities: list[TelemetryCapability] = Field(
         default_factory=lambda: [TelemetryCapability.FILESYSTEM_METADATA]
     )
+    optional_capabilities: list[TelemetryCapability] = Field(default_factory=list)
     evidence_requirements: str = Field(min_length=1)
     confidence_limitations: str = Field(min_length=1)
     threshold: float = Field(ge=0.0)
@@ -93,6 +95,14 @@ class DiscoveryTelemetryEvent(BaseModel):
     monotonic_ns: int = Field(ge=0)
 
 
+T_AuxiliaryEvent = TypeVar(
+    "T_AuxiliaryEvent",
+    ProcessTelemetryEvent,
+    EventLogTelemetryEvent,
+    DiscoveryTelemetryEvent,
+)
+
+
 class AdvancedSignalEvaluator(BaseSignalEvaluator, ABC):
     """Base class for advanced behavioural signal evaluators with telemetry checks."""
 
@@ -115,6 +125,95 @@ class AdvancedSignalEvaluator(BaseSignalEvaluator, ABC):
     def metadata(self) -> SignalMetadata:
         """Comprehensive metadata describing signal requirements and boundaries."""
         return self._metadata
+
+    def get_available_capabilities(
+        self, context: DetectionContext
+    ) -> set[TelemetryCapability]:
+        """Extract available telemetry capabilities declared in the context."""
+        raw_caps = context.config.get("available_capabilities")
+        if raw_caps is None:
+            return {TelemetryCapability.FILESYSTEM_METADATA}
+        if isinstance(raw_caps, (set, list, tuple)):
+            available: set[TelemetryCapability] = set()
+            for c in raw_caps:
+                if isinstance(c, TelemetryCapability):
+                    available.add(c)
+                else:
+                    try:
+                        available.add(TelemetryCapability(str(c)))
+                    except ValueError:
+                        continue
+            return available
+        return {TelemetryCapability.FILESYSTEM_METADATA}
+
+    def is_capability_available(
+        self, capability: TelemetryCapability, context: DetectionContext
+    ) -> bool:
+        """Check if a specific telemetry capability is available in context."""
+        return capability in self.get_available_capabilities(context)
+
+    def scope_auxiliary_telemetry(
+        self,
+        events: list[T_AuxiliaryEvent],
+        context: DetectionContext,
+    ) -> tuple[list[T_AuxiliaryEvent], list[dict[str, Any]]]:
+        """Scope auxiliary telemetry events to the context root and time horizon.
+
+        Filters events to ensure root identity matches and event timestamp falls
+        within the active evaluation window.
+
+        Returns:
+            A tuple of (valid_scoped_events, rejected_events_metadata).
+        """
+        scoped: list[T_AuxiliaryEvent] = []
+        rejected: list[dict[str, Any]] = []
+
+        window_duration_ns = int(
+            max(0.0, context.window_duration_seconds) * 1_000_000_000
+        )
+        window_start_ns = max(0, context.evaluated_monotonic_ns - window_duration_ns)
+
+        for ev in events:
+            if ev.root_id != context.root_id:
+                rejected.append(
+                    {
+                        "event_id": ev.event_id,
+                        "reason": "cross_root",
+                        "root_id": ev.root_id,
+                        "expected_root_id": context.root_id,
+                    }
+                )
+                continue
+
+            in_window = True
+            if ev.monotonic_ns > 0 and context.evaluated_monotonic_ns > 0:
+                if (
+                    ev.monotonic_ns < window_start_ns
+                    or ev.monotonic_ns > context.evaluated_monotonic_ns
+                ):
+                    in_window = False
+            else:
+                if (
+                    ev.timestamp_utc < context.window_start_utc
+                    or ev.timestamp_utc > context.window_end_utc
+                ):
+                    in_window = False
+
+            if not in_window:
+                rejected.append(
+                    {
+                        "event_id": ev.event_id,
+                        "reason": "out_of_window",
+                        "monotonic_ns": ev.monotonic_ns,
+                        "window_start_ns": window_start_ns,
+                        "window_end_ns": context.evaluated_monotonic_ns,
+                    }
+                )
+                continue
+
+            scoped.append(ev)
+
+        return scoped, rejected
 
     def evaluate(self, context: DetectionContext) -> SignalResult:
         """Evaluate behavioural criteria with explicit telemetry capability checks."""
@@ -160,18 +259,7 @@ class AdvancedSignalEvaluator(BaseSignalEvaluator, ABC):
         self, context: DetectionContext
     ) -> list[TelemetryCapability]:
         """Determine which required capabilities are unavailable in the context."""
-        raw_caps = context.config.get("available_capabilities")
-        if raw_caps is None:
-            # Default collector environment capability is FILESYSTEM_METADATA
-            available = {TelemetryCapability.FILESYSTEM_METADATA}
-        elif isinstance(raw_caps, (set, list, tuple)):
-            available = {
-                c if isinstance(c, TelemetryCapability) else TelemetryCapability(c)
-                for c in raw_caps
-            }
-        else:
-            available = {TelemetryCapability.FILESYSTEM_METADATA}
-
+        available = self.get_available_capabilities(context)
         return [
             cap for cap in self._metadata.required_capabilities if cap not in available
         ]

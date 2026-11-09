@@ -17,6 +17,7 @@ def _make_context(
     discovery_events: list[DiscoveryTelemetryEvent] | None = None,
     available_capabilities: set[TelemetryCapability] | None = None,
     window_duration_seconds: float = 2.0,
+    evaluated_monotonic_ns: int | None = None,
 ) -> DetectionContext:
     now = datetime.now(UTC)
     config = {}
@@ -40,12 +41,18 @@ def _make_context(
         window_duration_seconds=window_duration_seconds,
     )
 
+    eval_mono = (
+        evaluated_monotonic_ns
+        if evaluated_monotonic_ns is not None
+        else time.monotonic_ns()
+    )
+
     ev = FileEvent(
         event_id=str(uuid4()),
         root_id="root-1",
         file_path="dir/file.txt",
         event_type=EventType.MODIFIED,
-        monotonic_ns=time.monotonic_ns(),
+        monotonic_ns=eval_mono,
         source=EventSource.WINDOWS_WATCHER,
     )
 
@@ -53,7 +60,7 @@ def _make_context(
         root_id="root-1",
         events=[ev],
         stats=stats,
-        evaluated_monotonic_ns=time.monotonic_ns(),
+        evaluated_monotonic_ns=eval_mono,
         window_start_utc=now,
         window_end_utc=now,
         window_duration_seconds=window_duration_seconds,
@@ -94,6 +101,7 @@ def test_missing_telemetry_produces_explicit_capability_limitation():
 def test_rapid_discovery_triggers_with_read_telemetry():
     """Rapid enumeration across 16 directories by unknown process triggers T1083."""
     evaluator = FilesystemDiscoverySignalEvaluator(min_directories=15, threshold=5.0)
+    now_ns = 10_000_000_000
     disc_events = [
         DiscoveryTelemetryEvent(
             root_id="root-1",
@@ -101,7 +109,7 @@ def test_rapid_discovery_triggers_with_read_telemetry():
             operation="enumerate",
             process_id=9876,
             process_name="cmd.exe",
-            monotonic_ns=1_000_000 + i * 10_000,
+            monotonic_ns=now_ns - 1_000_000_000 + i * 10_000,
         )
         for i in range(16)
     ]
@@ -113,6 +121,7 @@ def test_rapid_discovery_triggers_with_read_telemetry():
             TelemetryCapability.FILESYSTEM_READ_ACCESS,
         },
         window_duration_seconds=2.0,  # 16 dirs / 2s = 8 dirs/sec (>= 5.0)
+        evaluated_monotonic_ns=now_ns,
     )
 
     res = evaluator.evaluate(ctx)
@@ -128,6 +137,7 @@ def test_rapid_discovery_triggers_with_read_telemetry():
 def test_benign_indexer_does_not_trigger():
     """Rapid enumeration attributed to SearchIndexer.exe is recognized as benign."""
     evaluator = FilesystemDiscoverySignalEvaluator(min_directories=15, threshold=5.0)
+    now_ns = 10_000_000_000
     disc_events = [
         DiscoveryTelemetryEvent(
             root_id="root-1",
@@ -135,7 +145,7 @@ def test_benign_indexer_does_not_trigger():
             operation="enumerate",
             process_id=1010,
             process_name="SearchIndexer.exe",
-            monotonic_ns=1_000_000 + i * 10_000,
+            monotonic_ns=now_ns - 1_000_000_000 + i * 10_000,
         )
         for i in range(20)
     ]
@@ -147,6 +157,7 @@ def test_benign_indexer_does_not_trigger():
             TelemetryCapability.FILESYSTEM_READ_ACCESS,
         },
         window_duration_seconds=2.0,
+        evaluated_monotonic_ns=now_ns,
     )
 
     res = evaluator.evaluate(ctx)
@@ -159,6 +170,7 @@ def test_benign_indexer_does_not_trigger():
 def test_throttled_discovery_does_not_trigger():
     """Enumeration below rate threshold does not trigger."""
     evaluator = FilesystemDiscoverySignalEvaluator(min_directories=15, threshold=10.0)
+    now_ns = 20_000_000_000
     disc_events = [
         DiscoveryTelemetryEvent(
             root_id="root-1",
@@ -166,7 +178,7 @@ def test_throttled_discovery_does_not_trigger():
             operation="enumerate",
             process_id=2020,
             process_name="powershell.exe",
-            monotonic_ns=1_000_000 + i * 10_000,
+            monotonic_ns=now_ns - 5_000_000_000 + i * 10_000,
         )
         for i in range(16)
     ]
@@ -178,8 +190,88 @@ def test_throttled_discovery_does_not_trigger():
             TelemetryCapability.FILESYSTEM_READ_ACCESS,
         },
         window_duration_seconds=10.0,  # 16 dirs / 10s = 1.6 dirs/sec (< 10.0)
+        evaluated_monotonic_ns=now_ns,
     )
 
     res = evaluator.evaluate(ctx)
     assert res.triggered is False
     assert "within normal operational limits" in res.explanation
+
+
+def test_concurrent_benign_indexer_does_not_mask_suspicious_discovery():
+    """A dominant SearchIndexer cannot mask concurrent rapid enumeration by cmd.exe."""
+    evaluator = FilesystemDiscoverySignalEvaluator(min_directories=15, threshold=5.0)
+    now_ns = 10_000_000_000
+    # 50 events from SearchIndexer across 50 dirs (dominant benign activity)
+    benign_events = [
+        DiscoveryTelemetryEvent(
+            root_id="root-1",
+            target_directory=f"C:/Indexed/Dir_{i}",
+            operation="enumerate",
+            process_id=1010,
+            process_name="SearchIndexer.exe",
+            monotonic_ns=now_ns - 1_000_000_000 + i * 1_000,
+        )
+        for i in range(50)
+    ]
+    # 18 events from cmd.exe across 18 dirs (suspicious discovery)
+    suspicious_events = [
+        DiscoveryTelemetryEvent(
+            root_id="root-1",
+            target_directory=f"C:/Users/Secret/Dir_{i}",
+            operation="enumerate",
+            process_id=4444,
+            process_name="cmd.exe",
+            monotonic_ns=now_ns - 1_000_000_000 + i * 10_000,
+        )
+        for i in range(18)
+    ]
+
+    ctx = _make_context(
+        discovery_events=benign_events + suspicious_events,
+        available_capabilities={
+            TelemetryCapability.FILESYSTEM_METADATA,
+            TelemetryCapability.FILESYSTEM_READ_ACCESS,
+            TelemetryCapability.PROCESS_EXECUTION,
+        },
+        window_duration_seconds=2.0,  # 18 dirs / 2s = 9 dirs/sec (>= 5.0)
+        evaluated_monotonic_ns=now_ns,
+    )
+
+    res = evaluator.evaluate(ctx)
+    assert res.triggered is True
+    assert res.metadata["is_benign_indexer"] is False
+    assert any(
+        p["process_name"] == "cmd.exe" for p in res.metadata["offending_processes"]
+    )
+    assert "SearchIndexer.exe".lower() in res.metadata["benign_processes_suppressed"]
+    assert "cmd.exe" in res.explanation
+
+
+def test_cross_root_discovery_events_rejected():
+    """Discovery events from an unrelated root do not contribute to evaluation."""
+    evaluator = FilesystemDiscoverySignalEvaluator(min_directories=15, threshold=5.0)
+    now_ns = 10_000_000_000
+    disc_events = [
+        DiscoveryTelemetryEvent(
+            root_id="foreign-root",
+            target_directory=f"C:/Users/Target/Dir_{i}",
+            operation="enumerate",
+            process_id=9876,
+            process_name="cmd.exe",
+            monotonic_ns=now_ns - 1_000_000_000 + i * 10_000,
+        )
+        for i in range(20)
+    ]
+    ctx = _make_context(
+        discovery_events=disc_events,
+        available_capabilities={
+            TelemetryCapability.FILESYSTEM_METADATA,
+            TelemetryCapability.FILESYSTEM_READ_ACCESS,
+        },
+        window_duration_seconds=2.0,
+        evaluated_monotonic_ns=now_ns,
+    )
+    res = evaluator.evaluate(ctx)
+    assert res.triggered is False
+    assert res.metadata["rejected_auxiliary_events_count"] == 20

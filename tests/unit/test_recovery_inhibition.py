@@ -116,20 +116,21 @@ def test_recovery_backup_extension_modification_triggers():
 def test_recovery_process_execution_telemetry():
     """When process telemetry is available, detects vssadmin and wbadmin commands."""
     evaluator = RecoveryInhibitionSignalEvaluator(threshold=1.0)
+    now_ns = time.monotonic_ns()
     proc_events = [
         ProcessTelemetryEvent(
             root_id="root-1",
             process_id=4567,
             process_name="vssadmin.exe",
             command_line="vssadmin.exe delete shadows /all /quiet",
-            monotonic_ns=1_000_000,
+            monotonic_ns=now_ns - 1_000_000_000,
         ),
         ProcessTelemetryEvent(
             root_id="root-1",
             process_id=4568,
             process_name="bcdedit.exe",
             command_line="bcdedit /set {default} recoveryenabled no",
-            monotonic_ns=2_000_000,
+            monotonic_ns=now_ns - 500_000_000,
         ),
     ]
     ctx = _make_context(
@@ -148,7 +149,86 @@ def test_recovery_process_execution_telemetry():
     assert len(res.evidence_event_ids) == 2
     assert "vssadmin.exe" in res.explanation
     assert res.metadata["process_telemetry_available"] is True
+    assert res.metadata["telemetry_state"]["process_execution"] == "evidence_observed"
     assert "capability_limitation" not in res.metadata
+
+
+def test_weak_recovery_indicators_do_not_trigger_alone():
+    """Single .vhd modification or routine $Recycle.Bin deletion do not trigger."""
+    evaluator = RecoveryInhibitionSignalEvaluator(threshold=1.0)
+    # 1. Single routine .vhd modification
+    ctx_vhd = _make_context(
+        [_make_event("virtual_machines/dev.vhd", event_type=EventType.MODIFIED)]
+    )
+    res_vhd = evaluator.evaluate(ctx_vhd)
+    assert res_vhd.triggered is False
+    assert res_vhd.metadata["weak_recovery_events"] == 1
+    assert res_vhd.metadata["strong_recovery_events"] == 0
+
+    # 2. Routine $Recycle.Bin deletion
+    ctx_bin = _make_context(
+        [
+            _make_event(
+                "$Recycle.Bin/S-1-5-21-12345/old_file.tmp",
+                event_type=EventType.DELETED,
+            )
+        ]
+    )
+    res_bin = evaluator.evaluate(ctx_bin)
+    assert res_bin.triggered is False
+    assert res_bin.metadata["weak_recovery_events"] == 1
+    assert res_bin.metadata["strong_recovery_events"] == 0
+
+
+def test_cross_root_process_event_rejected():
+    """Process execution telemetry from a foreign root is rejected."""
+    evaluator = RecoveryInhibitionSignalEvaluator(threshold=1.0)
+    now_ns = time.monotonic_ns()
+    proc_events = [
+        ProcessTelemetryEvent(
+            root_id="foreign-root-id",
+            process_id=9999,
+            process_name="vssadmin.exe",
+            command_line="vssadmin.exe delete shadows /all",
+            monotonic_ns=now_ns - 1_000_000,
+        )
+    ]
+    ctx = _make_context(
+        events=[],
+        process_events=proc_events,
+        available_capabilities={
+            TelemetryCapability.FILESYSTEM_METADATA,
+            TelemetryCapability.PROCESS_EXECUTION,
+        },
+    )
+    res = evaluator.evaluate(ctx)
+    assert res.triggered is False
+    assert res.metadata["rejected_auxiliary_events_count"] == 1
+
+
+def test_process_capability_unmonitored():
+    """When PROCESS_EXECUTION capability is unavailable, events are not inspected."""
+    evaluator = RecoveryInhibitionSignalEvaluator(threshold=1.0)
+    now_ns = time.monotonic_ns()
+    proc_events = [
+        ProcessTelemetryEvent(
+            root_id="root-1",
+            process_id=1234,
+            process_name="vssadmin.exe",
+            command_line="vssadmin.exe delete shadows /all",
+            monotonic_ns=now_ns - 1_000_000,
+        )
+    ]
+    # Context does NOT have PROCESS_EXECUTION capability
+    ctx = _make_context(
+        events=[],
+        process_events=proc_events,
+        available_capabilities={TelemetryCapability.FILESYSTEM_METADATA},
+    )
+    res = evaluator.evaluate(ctx)
+    assert res.triggered is False
+    assert res.metadata["process_telemetry_available"] is False
+    assert res.metadata["telemetry_state"]["process_execution"] == "unavailable"
 
 
 def test_benign_administrative_deletion_does_not_trigger():

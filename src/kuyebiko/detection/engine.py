@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from kuyebiko.detection.correlation import CorrelationEngine
 from kuyebiko.detection.models import (
     DetectionOutcome,
     DetectionResult,
@@ -30,7 +31,11 @@ from kuyebiko.detection.signals.extension_convergence import (
 from kuyebiko.detection.signals.filesystem_discovery import (
     FilesystemDiscoverySignalEvaluator,
 )
+from kuyebiko.detection.signals.in_place_transformation import (
+    InPlaceTransformationSignalEvaluator,
+)
 from kuyebiko.detection.signals.indicator_removal import IndicatorRemovalSignalEvaluator
+from kuyebiko.detection.signals.low_and_slow import LowAndSlowSignalEvaluator
 from kuyebiko.detection.signals.recovery_inhibition import (
     RecoveryInhibitionSignalEvaluator,
 )
@@ -53,6 +58,7 @@ class DetectionEngine(EventConsumer):
         auto_register_default_signals: bool = True,
         detection_family_threshold: int = 2,
         eval_interval_events: int = 1,
+        correlation_engine: CorrelationEngine | None = None,
     ) -> None:
         """Initialize detection engine with correlator, registry, and policies.
 
@@ -63,6 +69,7 @@ class DetectionEngine(EventConsumer):
             detection_family_threshold: Minimum triggered signal families required
                 for confirmed DETECTION (default 2). 1 family yields SUSPICIOUS.
             eval_interval_events: Evaluation throttling interval (default 1).
+            correlation_engine: CorrelationEngine instance for multi-signal analysis.
         """
         if detection_family_threshold < 1:
             raise ValueError(
@@ -80,6 +87,13 @@ class DetectionEngine(EventConsumer):
         self._registry = registry if registry is not None else SignalRegistry()
         self._detection_family_threshold = detection_family_threshold
         self._eval_interval_events = eval_interval_events
+        self._correlation_engine = (
+            correlation_engine
+            if correlation_engine is not None
+            else CorrelationEngine(
+                detection_family_threshold=detection_family_threshold
+            )
+        )
 
         self._listeners: list[Callable[[DetectionResult], None]] = []
         self._lock = threading.RLock()
@@ -97,6 +111,10 @@ class DetectionEngine(EventConsumer):
     @property
     def registry(self) -> SignalRegistry:
         return self._registry
+
+    @property
+    def correlation_engine(self) -> CorrelationEngine:
+        return self._correlation_engine
 
     @property
     def eval_interval_events(self) -> int:
@@ -130,6 +148,8 @@ class DetectionEngine(EventConsumer):
             DataDestructionSignalEvaluator(),
             FilesystemDiscoverySignalEvaluator(),
             IndicatorRemovalSignalEvaluator(),
+            InPlaceTransformationSignalEvaluator(),
+            LowAndSlowSignalEvaluator(),
         ]
         for sig in signals:
             try:
@@ -261,41 +281,27 @@ class DetectionEngine(EventConsumer):
             target_signals=target_signals,
         )
 
-        triggered_signals: list[str] = []
-        triggered_families_set: set[SignalFamily] = set()
+        (
+            outcome,
+            confidence_score,
+            severity_score,
+            telemetry_coverage,
+            evidence_completeness,
+            dedup_evidence,
+            explanation,
+        ) = self._correlation_engine.evaluate_correlation(
+            context=context,
+            signal_results=signal_results,
+            evaluation_errors=errors,
+        )
 
-        for sr in signal_results:
-            if sr.triggered:
-                triggered_signals.append(sr.signal_id)
-                triggered_families_set.add(sr.family)
-
+        triggered_signals: list[str] = [
+            sr.signal_id for sr in signal_results if sr.triggered
+        ]
+        triggered_families_set: set[SignalFamily] = {
+            sr.family for sr in signal_results if sr.triggered
+        }
         triggered_families = sorted(list(triggered_families_set), key=lambda f: f.value)
-
-        # Robust outcome determination: differentiate benign batch ops from ransomware
-        if errors:
-            outcome = DetectionOutcome.EVALUATION_ERROR
-        elif len(triggered_families) >= 3:
-            outcome = DetectionOutcome.DETECTION
-        elif len(triggered_families) >= self._detection_family_threshold:
-            # Multi-family correlation requires mutation/transformation confirmation
-            has_transformation = (
-                SignalFamily.FILE_TRANSFORMATION in triggered_families_set
-            )
-            has_rename_burst = (
-                "FS_BURST_WRITE" in triggered_signals
-                and "FS_RENAME_RATIO" in triggered_signals
-            )
-            if has_transformation or has_rename_burst:
-                outcome = DetectionOutcome.DETECTION
-            else:
-                # E.g. Burst Write + Traversal during build, or Delete + Traversal
-                outcome = DetectionOutcome.SUSPICIOUS_ACTIVITY
-        elif len(triggered_signals) > 0:
-            outcome = DetectionOutcome.SUSPICIOUS_ACTIVITY
-        elif context.is_telemetry_degraded:
-            outcome = DetectionOutcome.INSUFFICIENT_TELEMETRY
-        else:
-            outcome = DetectionOutcome.NO_DETECTION
 
         deg_reasons: list[str] = []
         if context.degradation_reason:
@@ -316,11 +322,20 @@ class DetectionEngine(EventConsumer):
             evaluation_errors=errors,
             is_telemetry_degraded=context.is_telemetry_degraded,
             degradation_reasons=deg_reasons,
+            confidence_score=confidence_score,
+            severity_score=severity_score,
+            telemetry_coverage=telemetry_coverage,
+            evidence_completeness=evidence_completeness,
+            contributing_event_ids=dedup_evidence.unique_event_ids,
+            explanation=explanation.summary,
             metadata={
                 "events_per_second": context.stats.events_per_second,
                 "unique_directories": len(context.stats.unique_directories),
                 "unique_extensions": len(context.stats.unique_extensions),
                 "unique_relative_paths": len(context.stats.unique_relative_paths),
+                "explanation_markdown": explanation.to_markdown(),
+                "shared_evidence_count": len(dedup_evidence.shared_event_ids),
+                "unique_evidence_count": dedup_evidence.total_unique_events,
             },
         )
 

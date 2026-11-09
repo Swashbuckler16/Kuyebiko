@@ -16,7 +16,13 @@ from kuyebiko.detection.signals.extension_convergence import (
 )
 from kuyebiko.detection.signals.rename_ratio import RenameRatioSignalEvaluator
 from kuyebiko.detection.window import RootSlidingWindow
-from kuyebiko.models.events import EventSource, EventType, FileEvent
+from kuyebiko.models.events import (
+    CorrelationProvenanceType,
+    EventSource,
+    EventType,
+    FileEvent,
+    sign_provenance_payload,
+)
 
 
 def _make_context(
@@ -142,7 +148,11 @@ def test_rename_ratio_insufficient_or_normal():
                 new_path=f"r_{i}.bak",
                 monotonic_ns=1_000,
                 source=EventSource.WINDOWS_WATCHER,
-                correlation_provenance=f"rename_correlator:r_{i}.txt->r_{i}.bak",
+                correlation_provenance=sign_provenance_payload(
+                    CorrelationProvenanceType.PHASE3_CORRELATOR,
+                    f"r_{i}.txt",
+                    f"r_{i}.bak",
+                ),
             )
         )
 
@@ -177,8 +187,10 @@ def test_rename_ratio_positive_trigger():
                 new_path=f"file_{i}.encrypted",
                 monotonic_ns=1_000,
                 source=EventSource.WINDOWS_WATCHER,
-                correlation_provenance=(
-                    f"rename_correlator:file_{i}.txt->file_{i}.encrypted"
+                correlation_provenance=sign_provenance_payload(
+                    CorrelationProvenanceType.PHASE3_CORRELATOR,
+                    f"file_{i}.txt",
+                    f"file_{i}.encrypted",
                 ),
             )
         )
@@ -310,7 +322,11 @@ def test_extension_convergence_negative_diverse_targets():
             new_path=target,
             monotonic_ns=1_000,
             source=EventSource.WINDOWS_WATCHER,
-            correlation_provenance=f"rename_correlator:{src}->{target}",
+            correlation_provenance=sign_provenance_payload(
+                CorrelationProvenanceType.PHASE3_CORRELATOR,
+                src,
+                target,
+            ),
         )
         for i, (src, target) in enumerate(pairs)
     ]
@@ -333,7 +349,11 @@ def test_rename_ratio_rejects_identical_paths_and_directory_renames():
             new_path="same.txt",
             monotonic_ns=1_000,
             source=EventSource.WINDOWS_WATCHER,
-            correlation_provenance="rename_correlator:same.txt->same.txt",
+            correlation_provenance=sign_provenance_payload(
+                CorrelationProvenanceType.PHASE3_CORRELATOR,
+                "same.txt",
+                "same.txt",
+            ),
         ),
         FileEvent(
             event_id="r2",
@@ -345,7 +365,11 @@ def test_rename_ratio_rejects_identical_paths_and_directory_renames():
             is_directory=True,
             monotonic_ns=1_000,
             source=EventSource.WINDOWS_WATCHER,
-            correlation_provenance="rename_correlator:oldfolder->subfolder",
+            correlation_provenance=sign_provenance_payload(
+                CorrelationProvenanceType.PHASE3_CORRELATOR,
+                "oldfolder",
+                "subfolder",
+            ),
         ),
         FileEvent(
             event_id="r3",

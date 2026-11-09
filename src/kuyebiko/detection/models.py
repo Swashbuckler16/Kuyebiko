@@ -112,6 +112,12 @@ class DetectionResult(BaseModel):
     evaluation_errors: list[str] = Field(default_factory=list)
     is_telemetry_degraded: bool = False
     degradation_reasons: list[str] = Field(default_factory=list)
+    confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    severity_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    telemetry_coverage: float = Field(default=1.0, ge=0.0, le=1.0)
+    evidence_completeness: float = Field(default=1.0, ge=0.0, le=1.0)
+    contributing_event_ids: list[str] = Field(default_factory=list)
+    explanation: str = Field(default="")
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("evaluated_at_utc", "window_start_utc", "window_end_utc")

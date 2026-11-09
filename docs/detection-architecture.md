@@ -134,11 +134,12 @@ All internal degradation sources feature deterministic, time-bounded recovery po
 
 ---
 
-## 7. Rename Correlation Provenance & Detection Integrity
+## 7. Rename Correlation Provenance & Cryptographic Trust Boundary
 
-1. **Explicit Correlation Provenance:** `FileEvent` models generated from Windows two-part rename notifications carry explicit provenance (`correlation_provenance = "rename_correlator:<old>-><new>"`). Unpaired or incomplete rename notifications cannot inflate `FS_RENAME_RATIO`.
-2. **Directory Rename Exclusion:** Directory renames (`is_directory = True`) are excluded from file rename pair counts and ratios to prevent administrative folder operations from skewing ransomware detection metrics.
-3. **Incremental Statistics Cross-Checking:** `RootSlidingWindow` incrementally tracks verified `rename_pairs_count`. Evaluators independently verify event-level provenance against `context.stats.rename_pairs_count` and flag any discrepancies (`stats_discrepancy = True`) in detection metadata.
+1. **Cryptographic Provenance Token:** `FileEvent` models generated from Windows two-part rename notifications carry explicit, authenticated provenance (`correlation_provenance = "<type>:<old>-><new>#<hmac_sha256>"`). Unsigned, tampered, or fabricated provenance strings are rejected by constant-time signature verification (`verify_provenance_signature`).
+2. **Untrusted Input Isolation:** Unpaired or explicit caller-supplied rename pairs (`explicit_pair:...`) cannot claim or forge correlator provenance, preventing untrusted callers from inflating `FS_RENAME_RATIO`.
+3. **Directory Rename Exclusion:** Directory renames (`is_directory = True`) are excluded from file rename pair counts and ratios to prevent administrative folder operations from skewing ransomware detection metrics.
+4. **Incremental Statistics Cross-Checking:** `RootSlidingWindow` incrementally tracks verified `rename_pairs_count`. Evaluators independently verify event-level provenance against `context.stats.rename_pairs_count` and flag any discrepancies (`stats_discrepancy = True`) in detection metadata.
 
 ---
 
@@ -162,27 +163,83 @@ A fundamental principle of Kuyebiko's advanced detection is separating **what ca
 - `TelemetryCapability.EVENT_LOG`: Windows Event Log channels (e.g., Security Event ID 1102 / System Event ID 104).
 - `TelemetryCapability.FILESYSTEM_READ_ACCESS`: File read operations and directory enumeration (requires filter driver or dedicated read tracing).
 
-**Explicit Capability Enforcement:** If an advanced signal requires capabilities not available in the current environment or context, the evaluator automatically returns `triggered = False`, `severity = 0.0`, and records explicit `capability_limitation` metadata. Missing telemetry never fabricates a false detection or false safety claim.
+**Capability Contracts & Scoping:**
+1. **Mandatory vs. Optional Capabilities:** `SignalMetadata` explicitly distinguishes `required_capabilities` (mandatory gates without which evaluation cannot execute) from `optional_capabilities` (corroborating sources like process execution or event logs). Missing optional capabilities never fail the evaluation; instead, the evaluator records unmonitored capability state.
+2. **Auxiliary Telemetry Scoping:** Evaluators strictly scope auxiliary telemetry (`ProcessTelemetryEvent`, `EventLogTelemetryEvent`, `DiscoveryTelemetryEvent`) using `scope_auxiliary_telemetry()`, rejecting events matching foreign `root_id`s or outside the sliding correlation window horizon.
+3. **Explicit Evidence vs. Limitation:** Telemetry state is explicitly classified into `evidence_observed`, `clean` (monitored with zero adverse activity), and `unavailable` (unmonitored), preventing confidence inflation when optional corroboration is absent.
 
 ### 9.2 Advanced Evaluator Modules (Steps 5.2 – 5.5)
 1. **`FS_RECOVERY_INHIBITION` (MITRE ATT&CK T1490):**
    - Family: `SignalFamily.RECOVERY_INTERFERENCE`.
-   - Filesystem observables: Deletion or destructive modification of recovery images, VSS shadow copy storage, backup catalogs (`.vhd`, `.vhdx`, `.bkf`, `.wbcat`, `System Volume Information`, `WindowsImageBackup`).
-   - Extended observables: Correlates command-line executions (`vssadmin delete shadows`, `wbadmin delete catalog`, `bcdedit /set ... recoveryenabled no`).
-   - Capability boundary: If process telemetry is absent, records explicit limitation while reliably inspecting recovery filesystem paths.
+   - Strong vs. Weak Indicators: Separates strong recovery indicators (VSS shadow storage, `WindowsImageBackup`, `System Volume Information`, `.bkf`, `.wbcat`, and process commands like `vssadmin delete shadows`) from weak indicators (`$Recycle.Bin`, routine `.vhd` modifications).
+   - Weak Indicator Protection: Weak indicators cannot independently trigger `FS_RECOVERY_INHIBITION`, preventing routine recycle bin clearing or virtual disk operations from raising false alarms.
+   - Capability boundary: If process telemetry is absent, records explicit limitation while reliably inspecting strong filesystem recovery paths.
 2. **`FS_DATA_DESTRUCTION` (MITRE ATT&CK T1485):**
    - Family: `SignalFamily.DATA_DESTRUCTION`.
-   - Distinct from `FS_DELETE_RATIO`: Requires substantial deletion volume across multiple distinct directory branches (`unique_directories >= 3`).
-   - Benign cleanup isolation: Mass deletions strictly confined to temporary or build directories (`temp`, `tmp`, `node_modules`, `target`, `build`, `.cache`) are recognized as benign cleanups and do not trigger destructive alarms.
+   - Contextual Discounting: Avoids unconditional vetoes based on directory naming. While single-folder or modest deletions (< 45 files or < 5 subdirs) in `temp`/`cache` are discounted as benign cleanups, massive deletion bursts (>= 45 files across >= 5 subdirectories) are detected even within cache trees.
+   - Mixed Workload Protection: Deletions in user document directories are evaluated independently and cannot be masked or suppressed by concurrent cache directory deletions.
 3. **`FS_FILESYSTEM_DISCOVERY` (MITRE ATT&CK T1083):**
    - Family: `SignalFamily.FILESYSTEM_DISCOVERY`.
    - Strictly declares `FILESYSTEM_READ_ACCESS` capability requirement.
-   - Change notifications (`ReadDirectoryChangesW`) cannot observe directory enumeration; when operating without dedicated read-access telemetry, the evaluator documents this capability limitation.
-   - When read-access telemetry is provided, detects high-velocity enumeration across directories while recognizing benign indexers (`SearchIndexer.exe`, `explorer.exe`).
+   - Granular Process Attribution: Evaluates enumeration rates and directory diversity per individual process. A high-volume benign indexing process (`SearchIndexer.exe`, `explorer.exe`) cannot mask concurrent rapid enumeration conducted by an unauthorized process (`cmd.exe`, `powershell.exe`).
 4. **`FS_INDICATOR_REMOVAL` (MITRE ATT&CK T1070):**
    - Family: `SignalFamily.INDICATOR_REMOVAL`.
    - Detects direct deletion of primary event logs (`winevt/Logs/Security.evtx`, `System.evtx`), NTFS USN journals (`$LogFile`, `$UsnJrnl`), or local forensic databases (`kuyebiko.db`).
    - Correlates with event log clearing records (Event 1102 / 104) and process commands (`wevtutil cl`).
-   - Distinguishes standard archival log rotation (`Archive-*.evtx`) from hostile indicator tampering.
+   - Enforces capability gating and window scoping on event log and process events.
+
+### 9.3 Multi-Horizon Observation Windows (Step 5.6)
+To detect stealthy ransomware strains that deliberately throttle activity to evade short sliding windows, Kuyebiko incorporates multi-tiered observation horizons:
+- **Short Horizon (10s, 2,000 events):** Captures high-frequency mutations and burst patterns.
+- **Medium Horizon (60s, 5,000 events):** Observes distributed modifications and low-and-slow campaigns.
+- **Long Horizon (300s, 10,000 events):** Preserves macro-trend behavioral persistence across extended intervals.
+
+**Architectural Guarantees:**
+1. **Per-Root Isolation:** Multi-horizon windows (`RootMultiHorizonWindow`) isolate observation state per monitored root.
+2. **Unified Degradation Propagation:** Telemetry degradation (capacity drops, retrograde drops, upstream loss) in *any* horizon propagates immediately to the primary detection context, preventing long horizons from concealing observation degradation.
+3. **Bounded Memory & O(1) Access:** Sub-windows maintain monotonic timestamps and incremental aggregates without unbounded event retention or scanning.
+
+### 9.4 Low-and-Slow & In-Place Transformation Signals (Step 5.6)
+1. **`FS_IN_PLACE_TRANSFORMATION` (MITRE ATT&CK T1486):**
+   - Family: `SignalFamily.FILE_TRANSFORMATION`.
+   - Detects systematic modification of >= 15 distinct files across >= 3 directory branches without rename operations or extension changes (`rename_ratio <= 15%`).
+   - Contextual discounting distinguishes single-file editor saves and localized scratch directory builds from genuine multi-directory overwrites.
+   - Observational integrity: strictly evaluates filesystem metadata without claiming content or entropy inspection.
+2. **`FS_LOW_AND_SLOW_ACTIVITY` (MITRE ATT&CK T1486):**
+   - Family: `SignalFamily.FILE_TRANSFORMATION`.
+   - Evaluates persistence across medium/long horizons (>= 15s time span) at throttled event rates (<= 6 ops/sec) spanning multiple directories.
+   - Fills the detection gap where high-frequency burst detectors (`FS_BURST_WRITE`) intentionally refrain from alerting.
+
+### 9.5 Benign Workload Discrimination Framework
+Validated against a structured 10-scenario workload corpus:
+1. Normal document editing (frequent saves to active file) -> Non-triggering.
+2. Software installation (binary creation burst in Program Files) -> Non-triggering.
+3. Git checkout / branch switching (.git objects) -> Non-triggering.
+4. Dev build operations (build/ and target/ scratch artifacts) -> Non-triggering.
+5. Database WAL writes (kuyebiko.db-wal periodic writes) -> Non-triggering.
+6. Backup / synchronization destination writing -> Non-triggering.
+7. Bulk file copying into destination directory -> Non-triggering.
+8. Repeated file edits (30 edits to single file) -> Non-triggering.
+9. Synthetic low-frequency multi-directory transformation -> Confirmed detection (`FS_LOW_AND_SLOW_ACTIVITY`).
+10. Synthetic in-place transformation across 5 directories -> Confirmed detection (`FS_IN_PLACE_TRANSFORMATION`).
+
+### 9.6 Advanced Multi-Signal Correlation & Explainability Engine (Step 5.7 & 5.8)
+The behavioural correlation layer (`src/kuyebiko/detection/correlation/`) synthesizes individual signal results into deterministic detection outcomes while eliminating collinear evidence inflation.
+
+1. **`SignalRelationshipModel`:**
+   - Categorizes signals into broad behavioral scopes: `TRANSFORMATION`, `DESTRUCTION`, `DEFENSE_EVASION`, `DISCOVERY`, `ACTIVITY_VOLUME`, and `TRAVERSAL`.
+   - Identifies overlapping pairs (e.g. `FS_DELETE_RATIO` and `FS_DATA_DESTRUCTION`; `FS_BURST_WRITE` and `FS_IN_PLACE_TRANSFORMATION`).
+   - Prevents treating two collinear manifestations of the same underlying event stream as independent corroboration.
+2. **`DeduplicatedEvidence`:**
+   - Event-level deduplication tracking unique vs shared event UUIDs.
+   - Computes a pairwise signal overlap matrix and evidence completeness ratio.
+3. **Deterministic Metric Separation:**
+   - **Severity Score (0.0–1.0):** Upper-bound damage potential across triggered signals with corroboration boost.
+   - **Confidence Score (0.0–1.0):** Certainty metric derived from independent families, discounted by evidence overlap and telemetry degradation.
+   - **Telemetry Coverage (0.0–1.0):** Ratio of active required capabilities vs unavailable sources.
+   - **Evidence Completeness (0.0–1.0):** Proportion of triggered signals providing contributing event IDs.
+4. **`ExplainabilityEngine`:**
+   - Generates structured markdown summaries documenting the classification rationale, contributing signals, independent families, overlapping pairs, and known uncertainties.
+
 
 

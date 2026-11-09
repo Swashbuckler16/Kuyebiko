@@ -10,7 +10,13 @@ from uuid import uuid4
 
 from kuyebiko.detection.engine import DetectionEngine
 from kuyebiko.detection.models import DetectionOutcome, SignalFamily
-from kuyebiko.models.events import EventSource, EventType, FileEvent
+from kuyebiko.models.events import (
+    CorrelationProvenanceType,
+    EventSource,
+    EventType,
+    FileEvent,
+    sign_provenance_payload,
+)
 
 
 def _make_event(
@@ -37,7 +43,11 @@ def _make_event(
         kwargs["old_path"] = old_path or "old.txt"
         kwargs["new_path"] = new_path or file_path
         kwargs["correlation_provenance"] = correlation_provenance or (
-            f"phase3_correlator:{kwargs['old_path']}->{kwargs['new_path']}"
+            sign_provenance_payload(
+                CorrelationProvenanceType.PHASE3_CORRELATOR,
+                kwargs["old_path"],
+                kwargs["new_path"],
+            )
         )
     return FileEvent(**kwargs)
 
